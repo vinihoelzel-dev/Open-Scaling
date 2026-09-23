@@ -691,7 +691,9 @@ static void send_motion(VkUp *a, int x, int y, SDL_Keymod mod) {
     event.xmotion.x = x;
     event.xmotion.y = y;
     event.xmotion.state = sdl_modifiers_to_x(mod);
-    XSendEvent(a->cap.dpy, a->cap.target, False, PointerMotionMask, &event);
+    /* propate=True: muitos jogos (SDL2/GLFW/Unity) só aceitam eventos sinteticos
+     * quando o flag de propagacao esta ligado; com False eles descartam em silencio. */
+    XSendEvent(a->cap.dpy, a->cap.target, True, PointerMotionMask, &event);
     XFlush(a->cap.dpy);
 }
 
