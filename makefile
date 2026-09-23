@@ -1,10 +1,10 @@
 .RECIPEPREFIX = >
 
 CC      := gcc
-CFLAGS  := -O2 -Wall -Wextra -Wno-unused-parameter -Isrc -Iexternal/ffx $(shell pkg-config --cflags sdl2)
+CFLAGS  := -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Isrc -Iexternal/ffx $(shell pkg-config --cflags sdl2)
 LDLIBS  := -lX11 -lXext -lm $(shell pkg-config --libs sdl2) -lvulkan
 
-SRC := src/main.c src/capture_x11.c src/input_uinput.c src/timer.c src/vk_triangle.c src/vk_preview.c src/vk_upscale.c
+SRC := src/main.c src/capture_x11.c src/input_uinput.c src/overlay_input.c src/timer.c src/vk_triangle.c src/vk_preview.c src/vk_upscale.c
 OBJ := $(SRC:src/%.c=build/%.o)
 BIN := build/open-scaling
 

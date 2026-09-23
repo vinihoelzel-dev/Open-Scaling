@@ -9,15 +9,21 @@ Captura a janela de um jogo ou aplicativo em execução e aplica o upscaling da 
 - Captura a tela/janela via **X11**.
 - Aplica o **FSR 1.0** (EASU para upscaling espacial + RCAS para nitidez).
 - Exibe o resultado em uma janela de preview (Vulkan).
-- **NOTA:** Por conta da janela que é criada, o input acaba quebrando. Estou trabalhando muito para corrigir isso. 
 
 ## Status
 
-- 🚧 **Beta**: em desenvolvimento ativo.
-- 🐛 Ainda possui bugs conhecidos que estou trabalhando para corrigir.
+- ⚠️**Beta**: em desenvolvimento ativo.
+- 🪳 Ainda possui bugs conhecidos que estou trabalhando para corrigir.
 - ⚠️ **Compatibilidade:** roda apenas em **XFCE / X11**. Wayland não é suportado no momento.
+- ❗Problemas de desempenho em CPUs e GPUs antigas, testes feitos em DDR3 plataforma 1155
+
+##NOTA UPDATES
+
+- Fiz alguns fixes no metodo de entrada, ainda pode quebrar dependendo do programa. Recomendo usar em jogos com ponteiro/indicador própio, Open Scaling ainda não possui a função trazer o ponteiro do desktop para a janela
 
 ## Exemplos
+
+- **Exemplos não são do estado atual do projeto.**
 
 | Nativo (Sem Scaling) | Open-Scaling (FSR 1 - EASU+RCAS) |
 |---|---|

@@ -229,34 +229,28 @@ while true; do
         1)
             echo -e "${GREEN}🚀 Modo FSR${NC}"
             target=$(pick_window) || { read -rp "ENTER..."; continue; }
-            read -rp "Escala (ex: 1.5) [enter = padrão]: " scale
-            read -rp "Largura máx [enter = padrão]: " maxw
-            read -rp "Altura máx [enter = padrão]: " maxh
+            read -rp "Perfil (ultra/quality/balanced/performance) [quality]: " profile
+            read -rp "Resolução máxima (ex: 1920x1080) [padrão]: " maxres
+            profile="${profile:-quality}"
             args=(fsr "$target")
-            [ -n "$scale" ] && args+=(--scale "$scale")
-            [ -n "$maxw" ]  && args+=(--max-w "$maxw")
-            [ -n "$maxh" ]  && args+=(--max-h "$maxh")
+            args+=("$profile")
+            [ -n "$maxres" ] && args+=(--max "$maxres")
             run_bin "${args[@]}"
             ;;
         2)
             echo -e "${GREEN}👁️  Modo Preview${NC}"
-            target=$(pick_window) || { read -rp "ENTER..."; continue; }
-            run_bin preview "$target"
+            run_bin preview
             ;;
         3)
             echo -e "${GREEN}⏱️  Benchmark${NC}"
-            target=$(pick_window) || { read -rp "ENTER..."; continue; }
             read -rp "Duração em segundos [enter = padrão]: " dur
-            args=(bench "$target")
-            [ -n "$dur" ] && args+=(--duration "$dur")
-            run_bin "${args[@]}"
+            [ -n "$dur" ] && run_bin bench "$dur" || run_bin bench
             ;;
         4)
             echo -e "${GREEN}📸 Snapshot${NC}"
-            target=$(pick_window) || { read -rp "ENTER..."; continue; }
             read -rp "Arquivo de saída [snap.png]: " out
-            out="${out:-snap.png}"
-            run_bin snap "$target" --output "$out"
+            out="${out:-snap.ppm}"
+            run_bin snap "$out"
             ;;
         5)
             show_windows
@@ -271,7 +265,7 @@ while true; do
             show_readme
             ;;
         9)
-            ensure_binary && "$BIN" --help
+            ensure_binary && "$BIN"
             ;;
         0)
             echo -e "${GREEN}👋 Até logo!${NC}"

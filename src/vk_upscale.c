@@ -1,5 +1,6 @@
 // src/vk_upscale.c — FSR 1 (EASU + RCAS) via Vulkan compute
 #include <SDL2/SDL.h>
+#include "overlay_input.h"
 #include <SDL2/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 #include <stdio.h>
@@ -7,6 +8,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <X11/keysym.h>
+#include <linux/input-event-codes.h>
 #include "capture_x11.h"
 #include "input_uinput.h"
 
@@ -748,6 +750,98 @@ static void forward_button(VkUp *a, int type, int out_x, int out_y,
 }
 
 static void forward_key(VkUp *a, int type, const SDL_KeyboardEvent *key) {
+    unsigned short linux_key = 0;
+    switch (key->keysym.scancode) {
+    case SDL_SCANCODE_A: linux_key = KEY_A; break;
+    case SDL_SCANCODE_B: linux_key = KEY_B; break;
+    case SDL_SCANCODE_C: linux_key = KEY_C; break;
+    case SDL_SCANCODE_D: linux_key = KEY_D; break;
+    case SDL_SCANCODE_E: linux_key = KEY_E; break;
+    case SDL_SCANCODE_F: linux_key = KEY_F; break;
+    case SDL_SCANCODE_G: linux_key = KEY_G; break;
+    case SDL_SCANCODE_H: linux_key = KEY_H; break;
+    case SDL_SCANCODE_I: linux_key = KEY_I; break;
+    case SDL_SCANCODE_J: linux_key = KEY_J; break;
+    case SDL_SCANCODE_K: linux_key = KEY_K; break;
+    case SDL_SCANCODE_L: linux_key = KEY_L; break;
+    case SDL_SCANCODE_M: linux_key = KEY_M; break;
+    case SDL_SCANCODE_N: linux_key = KEY_N; break;
+    case SDL_SCANCODE_O: linux_key = KEY_O; break;
+    case SDL_SCANCODE_P: linux_key = KEY_P; break;
+    case SDL_SCANCODE_Q: linux_key = KEY_Q; break;
+    case SDL_SCANCODE_R: linux_key = KEY_R; break;
+    case SDL_SCANCODE_S: linux_key = KEY_S; break;
+    case SDL_SCANCODE_T: linux_key = KEY_T; break;
+    case SDL_SCANCODE_U: linux_key = KEY_U; break;
+    case SDL_SCANCODE_V: linux_key = KEY_V; break;
+    case SDL_SCANCODE_W: linux_key = KEY_W; break;
+    case SDL_SCANCODE_X: linux_key = KEY_X; break;
+    case SDL_SCANCODE_Y: linux_key = KEY_Y; break;
+    case SDL_SCANCODE_Z: linux_key = KEY_Z; break;
+    case SDL_SCANCODE_1: linux_key = KEY_1; break;
+    case SDL_SCANCODE_2: linux_key = KEY_2; break;
+    case SDL_SCANCODE_3: linux_key = KEY_3; break;
+    case SDL_SCANCODE_4: linux_key = KEY_4; break;
+    case SDL_SCANCODE_5: linux_key = KEY_5; break;
+    case SDL_SCANCODE_6: linux_key = KEY_6; break;
+    case SDL_SCANCODE_7: linux_key = KEY_7; break;
+    case SDL_SCANCODE_8: linux_key = KEY_8; break;
+    case SDL_SCANCODE_9: linux_key = KEY_9; break;
+    case SDL_SCANCODE_0: linux_key = KEY_0; break;
+    case SDL_SCANCODE_RETURN: linux_key = KEY_ENTER; break;
+    case SDL_SCANCODE_ESCAPE: linux_key = KEY_ESC; break;
+    case SDL_SCANCODE_BACKSPACE: linux_key = KEY_BACKSPACE; break;
+    case SDL_SCANCODE_TAB: linux_key = KEY_TAB; break;
+    case SDL_SCANCODE_SPACE: linux_key = KEY_SPACE; break;
+    case SDL_SCANCODE_MINUS: linux_key = KEY_MINUS; break;
+    case SDL_SCANCODE_EQUALS: linux_key = KEY_EQUAL; break;
+    case SDL_SCANCODE_LEFTBRACKET: linux_key = KEY_LEFTBRACE; break;
+    case SDL_SCANCODE_RIGHTBRACKET: linux_key = KEY_RIGHTBRACE; break;
+    case SDL_SCANCODE_BACKSLASH: linux_key = KEY_BACKSLASH; break;
+    case SDL_SCANCODE_SEMICOLON: linux_key = KEY_SEMICOLON; break;
+    case SDL_SCANCODE_APOSTROPHE: linux_key = KEY_APOSTROPHE; break;
+    case SDL_SCANCODE_GRAVE: linux_key = KEY_GRAVE; break;
+    case SDL_SCANCODE_COMMA: linux_key = KEY_COMMA; break;
+    case SDL_SCANCODE_PERIOD: linux_key = KEY_DOT; break;
+    case SDL_SCANCODE_SLASH: linux_key = KEY_SLASH; break;
+    case SDL_SCANCODE_CAPSLOCK: linux_key = KEY_CAPSLOCK; break;
+    case SDL_SCANCODE_F1: linux_key = KEY_F1; break;
+    case SDL_SCANCODE_F2: linux_key = KEY_F2; break;
+    case SDL_SCANCODE_F3: linux_key = KEY_F3; break;
+    case SDL_SCANCODE_F4: linux_key = KEY_F4; break;
+    case SDL_SCANCODE_F5: linux_key = KEY_F5; break;
+    case SDL_SCANCODE_F6: linux_key = KEY_F6; break;
+    case SDL_SCANCODE_F7: linux_key = KEY_F7; break;
+    case SDL_SCANCODE_F8: linux_key = KEY_F8; break;
+    case SDL_SCANCODE_F9: linux_key = KEY_F9; break;
+    case SDL_SCANCODE_F10: linux_key = KEY_F10; break;
+    case SDL_SCANCODE_F11: linux_key = KEY_F11; break;
+    case SDL_SCANCODE_F12: linux_key = KEY_F12; break;
+    case SDL_SCANCODE_INSERT: linux_key = KEY_INSERT; break;
+    case SDL_SCANCODE_HOME: linux_key = KEY_HOME; break;
+    case SDL_SCANCODE_PAGEUP: linux_key = KEY_PAGEUP; break;
+    case SDL_SCANCODE_DELETE: linux_key = KEY_DELETE; break;
+    case SDL_SCANCODE_END: linux_key = KEY_END; break;
+    case SDL_SCANCODE_PAGEDOWN: linux_key = KEY_PAGEDOWN; break;
+    case SDL_SCANCODE_RIGHT: linux_key = KEY_RIGHT; break;
+    case SDL_SCANCODE_LEFT: linux_key = KEY_LEFT; break;
+    case SDL_SCANCODE_DOWN: linux_key = KEY_DOWN; break;
+    case SDL_SCANCODE_UP: linux_key = KEY_UP; break;
+    case SDL_SCANCODE_LCTRL: linux_key = KEY_LEFTCTRL; break;
+    case SDL_SCANCODE_LSHIFT: linux_key = KEY_LEFTSHIFT; break;
+    case SDL_SCANCODE_LALT: linux_key = KEY_LEFTALT; break;
+    case SDL_SCANCODE_LGUI: linux_key = KEY_LEFTMETA; break;
+    case SDL_SCANCODE_RCTRL: linux_key = KEY_RIGHTCTRL; break;
+    case SDL_SCANCODE_RSHIFT: linux_key = KEY_RIGHTSHIFT; break;
+    case SDL_SCANCODE_RALT: linux_key = KEY_RIGHTALT; break;
+    case SDL_SCANCODE_RGUI: linux_key = KEY_RIGHTMETA; break;
+    default: break;
+    }
+    if (a->virtual_mouse.active && linux_key) {
+        virtual_keyboard_key(&a->virtual_mouse, linux_key,
+                             type == KeyPress);
+        return;
+    }
     KeySym sym = sdl_to_x_keysym(key->keysym.sym);
     KeyCode code = XKeysymToKeycode(a->cap.dpy, sym);
     if (sym == NoSymbol || !code) return;
@@ -820,12 +914,13 @@ static void toggle_mouse_lock(VkUp *a) {
         fprintf(stderr, "[input] nao foi possivel travar o mouse: %s\n", SDL_GetError());
         return;
     }
+    SDL_ShowCursor(enable ? SDL_DISABLE : SDL_ENABLE);
     a->mouse_locked = !a->mouse_locked;
     a->input_mouse_x = a->in_w * 0.5f;
     a->input_mouse_y = a->in_h * 0.5f;
     a->virtual_mouse_remainder_x = 0.0f;
     a->virtual_mouse_remainder_y = 0.0f;
-    printf("[input] mouse %s (AltGr+L para alternar)\n",
+    printf("[input] mouse %s (Pause/Break ou AltGr+L para alternar)\n",
            a->mouse_locked ? "travado" : "liberado");
 }
 
@@ -870,7 +965,8 @@ int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
            a.out_w, a.out_h);
     a.window = SDL_CreateWindow("Open Scaling - FSR 1 (EASU+RCAS)",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        (int)a.out_w, (int)a.out_h, SDL_WINDOW_VULKAN);
+        (int)a.out_w, (int)a.out_h, 
+        SDL_WINDOW_VULKAN | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_BORDERLESS);
     if (!a.window) {
         fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
         capture_shutdown(&a.cap);
@@ -886,40 +982,25 @@ int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
     create_resources(&a);
     create_commands(&a);
 
-    if (virtual_mouse_init(&a.virtual_mouse))
-        printf("[input] mouse virtual uinput ativo para jogos.\n");
-    else
-        fprintf(stderr, "[input] mouse virtual indisponivel; usando fallback X11.\n");
+overlay_input_set_through(a.window);
+    overlay_grab_key(SDLK_ESCAPE);
+    overlay_grab_key(SDLK_F3);
+    overlay_grab_key(SDLK_F4);
 
-    printf("[vk] limite: 60 FPS. ESC/F3/F4 pra sair; AltGr+L trava/libera o mouse.\n");
+
+    printf("[vk] overlay input-transparente. ESC/F3/F4 saem.\n");
     bool run = true;
     uint64_t f = 0, t0 = SDL_GetTicks64();
     const uint64_t perf_freq = SDL_GetPerformanceFrequency();
     const uint64_t frame_interval = perf_freq / 60;
     uint64_t next_frame = SDL_GetPerformanceCounter();
     while (run) {
-        SDL_Event e;
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) run = false;
-            if (e.type == SDL_KEYDOWN &&
-                (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_F3 ||
-                 e.key.keysym.sym == SDLK_F4)) {
+        int hk;
+        while ((hk = overlay_poll_hotkey()) != SDLK_UNKNOWN) {
+            if (hk == SDLK_ESCAPE || hk == SDLK_F3 || hk == SDLK_F4)
                 run = false;
-                continue;
-            }
-            if (e.type == SDL_KEYDOWN && e.key.repeat == 0 &&
-                e.key.keysym.sym == SDLK_l && (e.key.keysym.mod & KMOD_RALT)) {
-                toggle_mouse_lock(&a);
-                a.suppress_lock_keyup = true;
-                continue;
-            }
-            if (e.type == SDL_KEYUP && a.suppress_lock_keyup &&
-                e.key.keysym.sym == SDLK_l) {
-                a.suppress_lock_keyup = false;
-                continue;
-            }
-            forward_input(&a, &e);
         }
+
         draw(&a);
         f++;
         uint64_t now = SDL_GetTicks64();
@@ -936,8 +1017,7 @@ int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
             wait_for_frame_deadline(next_frame, perf_freq);
     }
     vkDeviceWaitIdle(a.device);
-    if (a.mouse_locked) SDL_SetRelativeMouseMode(SDL_FALSE);
-    virtual_mouse_shutdown(&a.virtual_mouse);
+    overlay_release_all();
     capture_shutdown(&a.cap);
     SDL_DestroyWindow(a.window);
     SDL_Quit();
