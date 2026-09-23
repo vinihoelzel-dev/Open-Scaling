@@ -27,4 +27,4 @@ Captura a janela de um jogo ou aplicativo em execução e aplica o upscaling da 
 ## Como rodar
 
 ```bash
-./star.sh
+./start.sh
