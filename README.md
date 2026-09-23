@@ -2,13 +2,14 @@
 
 Upscaler de tela em tempo real para **X11 / XFCE**, usando **AMD FSR 1.0 (FidelityFX Super Resolution)** com os filtros **EASU + RCAS**.
 
-O projeto captura a janela de um jogo ou aplicativo em execução e aplica o upscaling da imagem em tempo real, melhorando a nitidez e o desempenho em jogos que rodam em resoluções menores ou sem suporte nativo a FSR.
+Captura a janela de um jogo ou aplicativo em execução e aplica o upscaling da imagem em tempo real, melhorando a nitidez e o desempenho em jogos **(ainda com MUITOS bugs de input)** que rodam em resoluções menores ou sem suporte nativo a FSR.
 
 ## Como funciona
 
 - Captura a tela/janela via **X11**.
 - Aplica o **FSR 1.0** (EASU para upscaling espacial + RCAS para nitidez).
 - Exibe o resultado em uma janela de preview (Vulkan).
+- **NOTA:** Por conta da janela que é criada, o input acaba quebrando. Estou trabalhando muito para corrigir isso. 
 
 ## Status
 
@@ -26,4 +27,4 @@ O projeto captura a janela de um jogo ou aplicativo em execução e aplica o ups
 ## Como rodar
 
 ```bash
-./Start-make.sh
+./star.sh
