@@ -160,7 +160,27 @@ bool capture_init_target(CaptureX11 *cap, Window target) {
 }
 
 bool capture_grab(CaptureX11 *cap) {
-    return XShmGetImage(cap->dpy, cap->target, cap->img, 0, 0, AllPlanes) != 0;
+    if (!capture_grab_async(cap)) return false;
+    return capture_grab_wait(cap);
+}
+
+// Captura via MIT-SHM. Nao existe "XShmGetImageAsync" na libXext; o ganho de
+// desempenho do SHM ja vem dai: o servidor X escreve os pixels direto na
+// memoria compartilhada e o cliente espera apenas um reply de poucos bytes
+// (sem transferencia de imagem pela socket X). Este chamada bloqueia somente
+// ate esse reply chegar; apos retornar true o buffer ja esta consistente.
+bool capture_grab_async(CaptureX11 *cap) {
+    return XShmGetImage(cap->dpy, cap->target, cap->img, 0, 0, AllPlanes)
+           == True;
+}
+
+// Mantido por compatibilidade com o pipeline assincrono: como o XShmGetImage
+// acima ja garante a conclusao da transferencia, aqui apenas drenamos eventos
+// X pendentes (se houver) sem bloquear.
+bool capture_grab_wait(CaptureX11 *cap) {
+    XEvent e;
+    while (XPending(cap->dpy)) XNextEvent(cap->dpy, &e);
+    return true;
 }
 
 void capture_shutdown(CaptureX11 *cap) {

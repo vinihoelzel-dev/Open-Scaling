@@ -23,6 +23,12 @@ bool capture_init(CaptureX11 *cap);
 bool capture_init_target(CaptureX11 *cap, Window target);
 Window capture_select_window(void);
 bool capture_grab(CaptureX11 *cap);
+// Captura via MIT-SHM (XShmGetImage): os pixels vao direto para a memoria
+// compartilhada; retorna quando o reply do servidor chega e o buffer esta
+// consistente. capture_grab_wait() mantem a mesma interface do pipeline em
+// estagios (atualmente um no-op que apenas drena eventos X pendentes).
+bool capture_grab_async(CaptureX11 *cap);
+bool capture_grab_wait(CaptureX11 *cap);
 void capture_shutdown(CaptureX11 *cap);
 
 static inline unsigned char *capture_data(CaptureX11 *cap) {

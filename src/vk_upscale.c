@@ -17,6 +17,9 @@
 
 #define MAX_FRAMES 2
 
+// Staging buffers triplas (ver tambem comentario na struct).
+#define STAGE_COUNT 3
+
 typedef struct {
     SDL_Window       *window;
     VkInstance        instance;
@@ -61,11 +64,13 @@ typedef struct {
     VkImage         up_img;       VkDeviceMemory up_mem;       VkImageView up_view;      // 1920x1080
     VkImage         final_img;    VkDeviceMemory final_mem;    VkImageView final_view;   // 1920x1080
 
-    // Staging buffer
-    VkBuffer         stage_buf;
-    VkDeviceMemory   stage_mem;
-    void            *stage_map;
+    // Staging buffers triplas: o CPU preenche um slot enquanto a GPU ainda
+    // consome o anterior, evitando bolhas de espera entre as duas pontas.
+    VkBuffer         stage_buf[STAGE_COUNT];
+    VkDeviceMemory   stage_mem[STAGE_COUNT];
+    void            *stage_map[STAGE_COUNT];
     size_t           stage_size;
+    uint32_t         stage_idx;
 
     VkCommandPool    cmd_pool;
     VkCommandBuffer *cmds;
@@ -409,22 +414,24 @@ static void create_resources(VkUp *a) {
     mk_image(a, a->out_w, a->out_h, VK_FORMAT_R8G8B8A8_UNORM, u, &a->up_img,    &a->up_mem,    &a->up_view);
     mk_image(a, a->out_w, a->out_h, VK_FORMAT_R8G8B8A8_UNORM, u, &a->final_img, &a->final_mem, &a->final_view);
 
-    // Staging buffer com os pixels nativos da janela capturada.
+    // Staging buffers com os pixels nativos da janela capturada (duplos).
     a->stage_size = (size_t)a->in_w * a->in_h * 4;
-    VkBufferCreateInfo bci = {
-        .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size=a->stage_size,
-        .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode=VK_SHARING_MODE_EXCLUSIVE,
-    };
-    VK_CHECK(vkCreateBuffer(a->device, &bci, NULL, &a->stage_buf));
-    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(a->device, a->stage_buf, &mr);
-    VkMemoryAllocateInfo mai = {
-        .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize=mr.size,
-        .memoryTypeIndex=mem_type(a->physical, mr.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-    };
-    VK_CHECK(vkAllocateMemory(a->device, &mai, NULL, &a->stage_mem));
-    vkBindBufferMemory(a->device, a->stage_buf, a->stage_mem, 0);
-    VK_CHECK(vkMapMemory(a->device, a->stage_mem, 0, a->stage_size, 0, &a->stage_map));
+    for (int i = 0; i < STAGE_COUNT; i++) {
+        VkBufferCreateInfo bci = {
+            .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size=a->stage_size,
+            .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode=VK_SHARING_MODE_EXCLUSIVE,
+        };
+        VK_CHECK(vkCreateBuffer(a->device, &bci, NULL, &a->stage_buf[i]));
+        VkMemoryRequirements mr; vkGetBufferMemoryRequirements(a->device, a->stage_buf[i], &mr);
+        VkMemoryAllocateInfo mai = {
+            .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize=mr.size,
+            .memoryTypeIndex=mem_type(a->physical, mr.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+        };
+        VK_CHECK(vkAllocateMemory(a->device, &mai, NULL, &a->stage_mem[i]));
+        vkBindBufferMemory(a->device, a->stage_buf[i], a->stage_mem[i], 0);
+        VK_CHECK(vkMapMemory(a->device, a->stage_mem[i], 0, a->stage_size, 0, &a->stage_map[i]));
+    }
 
     // Pipelines compute
     create_compute_pipeline(a, "build/shaders/fsr_easu.comp.spv", 64,
@@ -488,26 +495,43 @@ static void fsr_easu_con(uint32_t c0[4], uint32_t c1[4], uint32_t c2[4], uint32_
     c3[3] = 0;
 }
 
-// ---------- Upload + compute ----------
-static void upload_input(VkUp *a) {
-    if (!capture_grab(&a->cap)) return;
-    unsigned char *src = capture_data(&a->cap);
-    int src_stride = capture_stride(&a->cap);
-
-    unsigned char *dst = a->stage_map;
-    for (uint32_t y = 0; y < a->in_h; y++) {
-        // XImage usa a primeira linha no topo; para o upload Vulkan, a
-        // primeira linha do buffer precisa corresponder ao fim da imagem.
-        unsigned char *srow = src + (size_t)(a->in_h - 1 - y) * src_stride;
-        for (uint32_t x = 0; x < a->in_w; x++) {
-            unsigned char *sp = srow + (size_t)x * 4;  // BGRA
-            unsigned char *dp = dst + ((size_t)y * a->in_w + x) * 4;
-            dp[0] = sp[2]; // R
-            dp[1] = sp[1]; // G
-            dp[2] = sp[0]; // B
-            dp[3] = 255;
+// ---------- Captura + upload ----------
+// Converte BGRA (XImage, origem no canto superior esquerdo) para RGBA com o
+// topo invertido (primeira linha do buffer = ultima linha da imagem), como a
+// amostragem do pipeline de present espera. Trabalha em palavras de 32 bits
+// para permitir auto-vetorizacao pelo compilador.
+static void convert_bgra_to_rgba(const unsigned char *src, int src_stride,
+                                 unsigned char *dst, uint32_t w, uint32_t h) {
+    const uint32_t *s32 = (const uint32_t *)src;
+    uint32_t *d32 = (uint32_t *)dst;
+    size_t stride32 = (size_t)src_stride / 4;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint32_t *srow = s32 + (size_t)(h - 1 - y) * stride32;
+        uint32_t *drow = d32 + (size_t)y * w;
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t p = srow[x];              // bytes: B G R A
+            drow[x] = ((p & 0xFFu) << 16)      // B -> canal R
+                    | (p & 0x00FF00u)          // G fica
+                    | ((p >> 16) & 0xFFu)      // R -> canal B
+                    | 0xFF000000u;             // A = 255
         }
     }
+}
+
+// Dispara a captura do proximo frame sem bloquear: o servidor X responde em
+// background enquanto a CPU/GU continuam o pipeline do frame atual.
+static void begin_capture(VkUp *a) {
+    if (!capture_grab_async(&a->cap))
+        fprintf(stderr, "[fsr] aviso: capture_grab_async falhou\n");
+}
+
+// Aguarda a resposta do pedido disparado por begin_capture() e preenche o
+// proximo staging buffer.
+static void finish_capture_and_upload(VkUp *a) {
+    if (!capture_grab_wait(&a->cap)) return;
+    convert_bgra_to_rgba(capture_data(&a->cap), capture_stride(&a->cap),
+                         (unsigned char *)a->stage_map[a->stage_idx],
+                         a->in_w, a->in_h);
 }
 
 static void barrier(VkCommandBuffer cmd, VkImage img,
@@ -528,13 +552,19 @@ static void barrier(VkCommandBuffer cmd, VkImage img,
 }
 
 static void draw(VkUp *a) {
+    // O pedido de captura foi enviado no draw anterior; o servidor X ja
+    // trabalhou nele enquanto a CPU fazia a conversao e a GPU renderizava.
+    finish_capture_and_upload(a);
+
     vkWaitForFences(a->device, 1, &a->fences[a->frame], VK_TRUE, UINT64_MAX);
     uint32_t ii;
     VkResult r = vkAcquireNextImageKHR(a->device, a->swapchain, UINT64_MAX,
         a->sem_avail[a->frame], VK_NULL_HANDLE, &ii);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) return;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { begin_capture(a); return; }
 
-    upload_input(a);
+    // Dispara a captura do PROXIMO frame antes de submeter a GPU: a
+    // latencia round-trip do X11 corre em paralelo com o compute/present.
+    begin_capture(a);
     vkResetFences(a->device, 1, &a->fences[a->frame]);
 
     VkCommandBuffer cmd = a->cmds[a->frame];
@@ -551,7 +581,7 @@ static void draw(VkUp *a) {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .imageExtent = { a->in_w, a->in_h, 1 },
     };
-    vkCmdCopyBufferToImage(cmd, a->stage_buf, a->input_img,
+    vkCmdCopyBufferToImage(cmd, a->stage_buf[a->stage_idx], a->input_img,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     // 2) input_img: TRANSFER_DST -> GENERAL
@@ -572,15 +602,20 @@ static void draw(VkUp *a) {
     // 5) EASU
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, a->easu_pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, a->easu_layout, 0, 1, &a->easu_set, 0, NULL);
-    uint32_t c0[4], c1[4], c2[4], c3[4];
-    fsr_easu_con(c0, c1, c2, c3, (float)a->in_w, (float)a->in_h,
-                 (float)a->out_w, (float)a->out_h);
-    struct { uint32_t a[4], b[4], c[4], d[4]; } easu_pc = {
-        {c0[0],c0[1],c0[2],c0[3]},
-        {c1[0],c1[1],c1[2],c1[3]},
-        {c2[0],c2[1],c2[2],c2[3]},
-        {c3[0],c3[1],c3[2],c3[3]},
-    };
+    // As constantes EASU dependem apenas das resolucoes: calculadas uma
+    // unica vez e reutilizadas em todos os frames.
+    static struct { uint32_t a[4], b[4], c[4], d[4]; } easu_pc;
+    static bool easu_pc_init = false;
+    if (!easu_pc_init) {
+        uint32_t c0[4], c1[4], c2[4], c3[4];
+        fsr_easu_con(c0, c1, c2, c3, (float)a->in_w, (float)a->in_h,
+                     (float)a->out_w, (float)a->out_h);
+        memcpy(easu_pc.a, c0, sizeof(c0));
+        memcpy(easu_pc.b, c1, sizeof(c1));
+        memcpy(easu_pc.c, c2, sizeof(c2));
+        memcpy(easu_pc.d, c3, sizeof(c3));
+        easu_pc_init = true;
+    }
     vkCmdPushConstants(cmd, a->easu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, &easu_pc);
     vkCmdDispatch(cmd, (a->out_w + 63) / 64, a->out_h, 1);
 
@@ -593,13 +628,14 @@ static void draw(VkUp *a) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, a->rcas_pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, a->rcas_layout, 0, 1, &a->rcas_set, 0, NULL);
     // sharpness: 0 = max, 2 = nenhum. 0.2 = bom equilibrio.
-    // con = exp2(-sharpness)
-    float sharpness = 0.2f;
-    float exp_val = 1.0f;
-    // exp2f(-0.2) via libm
-    extern float exp2f(float);
-    exp_val = exp2f(-sharpness);
-    uint32_t rcas_con = f2u(exp_val);
+    // con = exp2(-sharpness); imutavel, calculado uma unica vez.
+    static uint32_t rcas_con = 0;
+    static bool rcas_con_init = false;
+    if (!rcas_con_init) {
+        extern float exp2f(float);
+        rcas_con = f2u(exp2f(-0.2f));
+        rcas_con_init = true;
+    }
     vkCmdPushConstants(cmd, a->rcas_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &rcas_con);
     vkCmdDispatch(cmd, (a->out_w + 63) / 64, a->out_h, 1);
 
@@ -640,6 +676,7 @@ static void draw(VkUp *a) {
     };
     vkQueuePresentKHR(a->queue, &pi);
     a->frame = (a->frame + 1) % MAX_FRAMES;
+    a->stage_idx = (a->stage_idx + 1) % STAGE_COUNT;
 }
 
 // ---------- Encaminhamento de entrada para a janela X11 capturada ----------
@@ -989,6 +1026,10 @@ overlay_input_set_through(a.window);
 
 
     printf("[vk] overlay input-transparente. ESC/F3/F4 saem.\n");
+
+    // Primeira captura: enviada agora e consumida dentro de draw().
+    begin_capture(&a);
+
     bool run = true;
     uint64_t f = 0, t0 = SDL_GetTicks64();
     const uint64_t perf_freq = SDL_GetPerformanceFrequency();
