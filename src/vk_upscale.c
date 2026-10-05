@@ -82,6 +82,7 @@ typedef struct {
     CaptureX11       cap;
     uint32_t         in_w, in_h;
     uint32_t         out_w, out_h;
+    float            sharpness;
     bool             mouse_locked;
     bool             suppress_lock_keyup;
     float            input_mouse_x, input_mouse_y;
@@ -627,13 +628,13 @@ static void draw(VkUp *a) {
     // 7) RCAS
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, a->rcas_pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, a->rcas_layout, 0, 1, &a->rcas_set, 0, NULL);
-    // sharpness: 0 = max, 2 = nenhum. 0.2 = bom equilibrio.
-    // con = exp2(-sharpness); imutavel, calculado uma unica vez.
+    // con = exp2(-2*sharpness): sharpness 0 -> sem nitidez, 1 -> maxima.
+    // Imutavel por execucao, calculado uma unica vez.
     static uint32_t rcas_con = 0;
     static bool rcas_con_init = false;
     if (!rcas_con_init) {
         extern float exp2f(float);
-        rcas_con = f2u(exp2f(-0.2f));
+        rcas_con = f2u(exp2f(-2.0f * a->sharpness));
         rcas_con_init = true;
     }
     vkCmdPushConstants(cmd, a->rcas_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &rcas_con);
@@ -975,7 +976,9 @@ static void wait_for_frame_deadline(uint64_t deadline, uint64_t frequency) {
 }
 
 int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
-                   float scale, uint32_t max_w, uint32_t max_h) {
+                   float scale, uint32_t max_w, uint32_t max_h,
+                   float sharpness, bool vsync) {
+    (void)vsync; // swapchain FIFO ja sincroniza com o monitor; pacing abaixo e o teto.
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
     VkUp a = {0};
     a.virtual_mouse.fd = -1;
@@ -986,6 +989,7 @@ int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
     }
     a.in_w = a.cap.width;
     a.in_h = a.cap.height;
+    a.sharpness = sharpness;
     uint32_t screen_w = DisplayWidth(a.cap.dpy, DefaultScreen(a.cap.dpy));
     uint32_t screen_h = DisplayHeight(a.cap.dpy, DefaultScreen(a.cap.dpy));
     uint32_t limit_w = max_w < screen_w ? max_w : screen_w;

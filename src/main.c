@@ -3,6 +3,7 @@
 #include "vk_triangle.h"
 #include "vk_preview.h"
 #include "vk_upscale.h"
+#include "ui.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,7 +62,7 @@ static int cmd_fsr(int argc, char **argv) {
     }
     if (!target) target = capture_select_window();
     if (!target) return 1;
-    return vk_upscale_run(target, out_w, out_h, scale, max_w, max_h);
+    return vk_upscale_run(target, out_w, out_h, scale, max_w, max_h, 0.5f, true);
 }
 
 static void salvar_ppm(const char *path, CaptureX11 *cap) {
@@ -142,6 +143,23 @@ static int cmd_bench(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_gui(void) {
+    UiConfig uicfg;
+    printf("[ui] abrindo interface de configuracao...\n");
+    if (ui_config_run(&uicfg) != 0) {
+        printf("[ui] cancelado.\n");
+        return 0;
+    }
+    Window target = (Window)uicfg.window_id;
+    float scale = ui_scale_factor(uicfg.scale_idx);
+    float sharp = ui_sharpness(uicfg.sharp_idx);
+    if (!target) target = capture_select_window();
+    if (!target) return 1;
+    printf("[ui] janela=0x%lx escala=%.1fx sharpness=%.2f vsync=%d fullscreen=%d\n",
+           (unsigned long)target, scale, sharp, uicfg.vsync, uicfg.fullscreen);
+    return vk_upscale_run(target, 0, 0, scale, 1920, 1080, sharp, uicfg.vsync);
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Uso: %s <comando> [args]\n"
@@ -150,6 +168,8 @@ static void usage(const char *prog) {
         "  bench [segundos]       benchmark de captura (padrao: 5s)\n"
         "  vk                     janela Vulkan + triangulo (teste)\n"
         "  preview                preview da tela via Vulkan\n"
+        "  gui                      interface grafica de configuracao\n"
+        "                           (recomendado para usuarios normais)\n"
         "  fsr [janela] [perfil] [WxH] [--max WxH]\n"
         "                         FSR 1; perfis: ultra (1.3x), quality (1.5x),\n"
         "                         balanced (1.7x), performance (2x).\n"
@@ -164,6 +184,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "bench")   == 0) return cmd_bench(argc - 2, argv + 2);
     if (strcmp(cmd, "vk")      == 0) return vk_triangle_run();
     if (strcmp(cmd, "preview") == 0) return vk_preview_run();
+    if (strcmp(cmd, "gui")     == 0) return cmd_gui();
     if (strcmp(cmd, "fsr")     == 0) return cmd_fsr(argc - 2, argv + 2);
     usage(argv[0]);
     return 1;
