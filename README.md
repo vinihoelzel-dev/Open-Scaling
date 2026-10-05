@@ -51,7 +51,7 @@ Captura a janela de um jogo ou aplicativo em execução e aplica o upscaling da 
 
 1. Clone o repositório:
    ```bash
-   git clone <url-do-repositorio>
+   git clone https://github.com/vinihoelzel-dev/Open-Scaling
    cd Open-Scaling
    ```
 
