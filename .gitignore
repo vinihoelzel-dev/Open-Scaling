@@ -1,4 +1,8 @@
 # Build artifacts
 build/
 *.o
-*.spv
+
+# External dependencies
+external/imgui
+# Config local do ImGui
+imgui.ini

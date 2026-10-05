@@ -3,6 +3,7 @@
 #include "vk_triangle.h"
 #include "vk_preview.h"
 #include "vk_upscale.h"
+#include "gui.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,6 +151,7 @@ static void usage(const char *prog) {
         "  bench [segundos]       benchmark de captura (padrao: 5s)\n"
         "  vk                     janela Vulkan + triangulo (teste)\n"
         "  preview                preview da tela via Vulkan\n"
+        "  gui                    launcher grafico (Dear ImGui)\n"
         "  fsr [janela] [perfil] [WxH] [--max WxH]\n"
         "                         FSR 1; perfis: ultra (1.3x), quality (1.5x),\n"
         "                         balanced (1.7x), performance (2x).\n"
@@ -164,6 +166,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "bench")   == 0) return cmd_bench(argc - 2, argv + 2);
     if (strcmp(cmd, "vk")      == 0) return vk_triangle_run();
     if (strcmp(cmd, "preview") == 0) return vk_preview_run();
+    if (strcmp(cmd, "gui")     == 0) return vk_gui_run();
     if (strcmp(cmd, "fsr")     == 0) return cmd_fsr(argc - 2, argv + 2);
     usage(argv[0]);
     return 1;
