@@ -1,5 +1,9 @@
 # Open-Scaling v0.30 (Beta)
 
+![Status](https://img.shields.io/badge/status-beta-yellow)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Platform](https://img.shields.io/badge/platform-Linux%20%2F%20X11-lightgrey)
+
 Upscaler de tela em tempo real para **X11 / XFCE**, usando **AMD FSR 1.0** (FidelityFX Super Resolution) com os filtros **EASU + RCAS**.
 
 Captura a janela de um jogo ou aplicativo em execução e aplica o upscaling da imagem em tempo real, melhorando a nitidez e o desempenho em jogos que rodam em resoluções menores ou sem suporte nativo a FSR **(ainda com bugs conhecidos de input)**.
