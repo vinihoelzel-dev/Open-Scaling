@@ -29,13 +29,57 @@ static bool parse_profile(const char *text, float *scale) {
 }
 
 static int cmd_fsr(int argc, char **argv) {
+    if (!XInitThreads()) {
+        fprintf(stderr, "[erro] XInitThreads falhou; captura paralela indisponivel.\n");
+        return 1;
+    }
+
     Window target = 0;
     uint32_t out_w = 0, out_h = 0;
     uint32_t max_w = 1920, max_h = 1080;
     float scale = 1.5f; // quality
+    bool framegen_enabled = false;
+    uint32_t framegen_factor = 2;
+    const char *frameflow_socket = "/tmp/open-frameflow.sock";
+    int requested_gpu = -1;
 
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--max") == 0) {
+        if (strcmp(argv[i], "--framegen") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "[erro] use --framegen 2|3|4.\n");
+                return 1;
+            }
+            char *end = NULL;
+            unsigned long factor = strtoul(argv[i], &end, 10);
+            if (!end || *end || factor < 2 || factor > 4) {
+                fprintf(stderr, "[erro] multiplicador de framegen deve ser 2, 3 ou 4.\n");
+                return 1;
+            }
+            framegen_enabled = true;
+            framegen_factor = (uint32_t)factor;
+        } else if (strcmp(argv[i], "--frameflow-socket") == 0) {
+            if (++i == argc || !argv[i][0]) {
+                fprintf(stderr, "[erro] use --frameflow-socket CAMINHO.\n");
+                return 1;
+            }
+            frameflow_socket = argv[i];
+        } else if (strcmp(argv[i], "--vk-gpu") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "[erro] use --vk-gpu INDEX|auto.\n");
+                return 1;
+            }
+            if (strcmp(argv[i], "auto") == 0) {
+                requested_gpu = -1;
+            } else {
+                char *end = NULL;
+                unsigned long index = strtoul(argv[i], &end, 10);
+                if (!end || *end || index > INT32_MAX) {
+                    fprintf(stderr, "[erro] indice Vulkan invalido: %s\n", argv[i]);
+                    return 1;
+                }
+                requested_gpu = (int)index;
+            }
+        } else if (strcmp(argv[i], "--max") == 0) {
             if (++i == argc || !parse_resolution(argv[i], &max_w, &max_h)) {
                 fprintf(stderr, "[erro] use --max WxH.\n");
                 return 1;
@@ -62,7 +106,9 @@ static int cmd_fsr(int argc, char **argv) {
     }
     if (!target) target = capture_select_window();
     if (!target) return 1;
-    return vk_upscale_run(target, out_w, out_h, scale, max_w, max_h);
+    return vk_upscale_run(target, out_w, out_h, scale, max_w, max_h,
+                          framegen_enabled, framegen_factor, frameflow_socket,
+                          requested_gpu);
 }
 
 static void salvar_ppm(const char *path, CaptureX11 *cap) {
@@ -155,6 +201,10 @@ static void usage(const char *prog) {
         "  fsr [janela] [perfil] [WxH] [--max WxH]\n"
         "                         FSR 1; perfis: ultra (1.3x), quality (1.5x),\n"
         "                         balanced (1.7x), performance (2x).\n"
+        "                         --framegen 2|3|4 ativa RIFE via Open-FrameFlow;\n"
+        "                         servico ausente mantem FSR normal.\n"
+        "                         --vk-gpu INDEX|auto escolhe GPU Vulkan; com\n"
+        "                         framegen, integrado e preferido por padrao.\n"
         "                         Teto padrao: 1920x1080 e resolucao da tela.\n",
         prog);
 }

@@ -13,6 +13,10 @@ cd "$(dirname "$0")" || exit 1
 BIN="./build/open-scaling"
 BUILD_DIR="build"
 SHADER_BUILD="./Start-make.sh"
+FRAMEFLOW_BIN="${OPEN_FRAMEFLOW_BIN:-../Open-FrameFlow/build/open-frameflow}"
+FRAMEFLOW_PID=""
+FRAMEFLOW_SOCKET=""
+FRAMEFLOW_RUNTIME_DIR=""
 
 # =========================================================
 # Checagens
@@ -85,6 +89,87 @@ run_bin() {
     fi
     return $rc
 }
+
+stop_frameflow() {
+    if [ -n "$FRAMEFLOW_PID" ]; then
+        kill -TERM "$FRAMEFLOW_PID" 2>/dev/null || true
+        wait "$FRAMEFLOW_PID" 2>/dev/null || true
+        FRAMEFLOW_PID=""
+    fi
+    if [ -n "$FRAMEFLOW_SOCKET" ]; then
+        rm -f -- "$FRAMEFLOW_SOCKET"
+        FRAMEFLOW_SOCKET=""
+    fi
+    if [ -n "$FRAMEFLOW_RUNTIME_DIR" ]; then
+        rmdir -- "$FRAMEFLOW_RUNTIME_DIR" 2>/dev/null || true
+        FRAMEFLOW_RUNTIME_DIR=""
+    fi
+}
+
+start_frameflow() {
+    local algorithm="$1"
+    local model_dir="$2"
+    local gpu_id="$3"
+    local require_int8="$4"
+
+    if [ ! -x "$FRAMEFLOW_BIN" ]; then
+        echo -e "${RED}❌ Open-FrameFlow não encontrado ou não executável: $FRAMEFLOW_BIN${NC}"
+        echo -e "${YELLOW}   Defina OPEN_FRAMEFLOW_BIN ou compile o Open-FrameFlow.${NC}"
+        return 1
+    fi
+    if [ "$algorithm" = "rife" ]; then
+        if [ ! -f "$model_dir/flownet.param" ] || [ ! -f "$model_dir/flownet.bin" ]; then
+            echo -e "${RED}❌ Modelo RIFE inválido: esperava flownet.param e flownet.bin em $model_dir${NC}"
+            return 1
+        fi
+    fi
+
+    FRAMEFLOW_RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/open-frameflow.XXXXXX") || {
+        echo -e "${RED}❌ Não foi possível criar diretório temporário para o socket.${NC}"
+        return 1
+    }
+    FRAMEFLOW_SOCKET="$FRAMEFLOW_RUNTIME_DIR/frameflow.sock"
+    local -a server_args=(--algorithm "$algorithm" --socket "$FRAMEFLOW_SOCKET")
+    if [ "$algorithm" = "rife" ]; then
+        server_args+=(--model "$model_dir" --gpu "$gpu_id" --inference-scale 1.0)
+        [ "$require_int8" -eq 1 ] && server_args+=(--require-int8)
+    fi
+
+    if [ "$algorithm" = "rife" ]; then
+        echo -e "${CYAN}Iniciando Open-FrameFlow RIFE (GPU Vulkan $gpu_id)...${NC}"
+    else
+        echo -e "${CYAN}Iniciando Open-FrameFlow Optical Flow DIS (CPU)...${NC}"
+    fi
+    "$FRAMEFLOW_BIN" "${server_args[@]}" &
+    FRAMEFLOW_PID=$!
+
+    for _ in {1..600}; do
+        if [ -S "$FRAMEFLOW_SOCKET" ]; then
+            if [ "$algorithm" = "rife" ]; then
+                echo -e "${GREEN}✅ Open-FrameFlow pronto; modelo: $model_dir${NC}"
+            else
+                echo -e "${GREEN}✅ Open-FrameFlow pronto; algoritmo DIS na CPU.${NC}"
+            fi
+            return 0
+        fi
+        local process_state
+        process_state=$(ps -o stat= -p "$FRAMEFLOW_PID" 2>/dev/null)
+        if [ -z "$process_state" ] || [[ "$process_state" == Z* ]]; then
+            wait "$FRAMEFLOW_PID"
+            FRAMEFLOW_PID=""
+            stop_frameflow
+            echo -e "${RED}❌ Open-FrameFlow encerrou antes de criar o socket.${NC}"
+            return 1
+        fi
+        sleep 0.1
+    done
+
+    echo -e "${RED}❌ Timeout aguardando o Open-FrameFlow iniciar.${NC}"
+    stop_frameflow
+    return 1
+}
+
+trap stop_frameflow EXIT
 
 # =========================================================
 # Leitura de janelas X11
@@ -231,11 +316,65 @@ while true; do
             target=$(pick_window) || { read -rp "ENTER..."; continue; }
             read -rp "Perfil (ultra/quality/balanced/performance) [quality]: " profile
             read -rp "Resolução máxima (ex: 1920x1080) [padrão]: " maxres
+            read -rp "Ativar geração de quadros via Open-FrameFlow? [y/N]: " framegen
             profile="${profile:-quality}"
             args=(fsr "$target")
             args+=("$profile")
             [ -n "$maxres" ] && args+=(--max "$maxres")
+            if [[ "$framegen" =~ ^[Yy]$ ]]; then
+                read -rp "Multiplicador de frames (2/3/4) [2]: " factor
+                factor="${factor:-2}"
+                if [[ "$factor" =~ ^[234]$ ]]; then
+                    echo -e "${CYAN}Metodo de framegen:${NC}"
+                    echo -e "  ${YELLOW}[1]${NC} RIFE (GPU Vulkan)"
+                    echo -e "  ${YELLOW}[2]${NC} Optical Flow DIS (CPU)"
+                    read -rp "Escolha (1/2) [1]: " algorithm_mode
+                    algorithm_mode="${algorithm_mode:-1}"
+                    algorithm=""
+                    model_dir=""
+                    gpu_id=""
+                    require_int8=0
+                    if [ "$algorithm_mode" = "1" ]; then
+                        algorithm="rife"
+                        echo -e "${CYAN}Precisao/modelo RIFE:${NC}"
+                        echo -e "  ${YELLOW}[1]${NC} RIFE original (FP16 storage)"
+                        echo -e "  ${YELLOW}[2]${NC} RIFE quantizado INT8"
+                        read -rp "Escolha (1/2) [1]: " model_mode
+                        model_mode="${model_mode:-1}"
+                        if [[ ! "$model_mode" =~ ^[12]$ ]]; then
+                            echo -e "${YELLOW}Opção inválida; seguindo apenas com FSR.${NC}"
+                            algorithm=""
+                        else
+                            default_model="${OPEN_FRAMEFLOW_MODEL:-$HOME/Repo/librife-ncnn-vulkan/models/rife-v4}"
+                            read -rp "Pasta do modelo RIFE [$default_model]: " model_dir
+                            model_dir="${model_dir:-$default_model}"
+                            default_gpu="${OPEN_FRAMEFLOW_GPU:-1}"
+                            read -rp "Índice da GPU Vulkan usada pelo RIFE [$default_gpu]: " gpu_id
+                            gpu_id="${gpu_id:-$default_gpu}"
+                            if [[ ! "$gpu_id" =~ ^[0-9]+$ ]]; then
+                                echo -e "${YELLOW}Índice de GPU inválido; seguindo apenas com FSR.${NC}"
+                                algorithm=""
+                            fi
+                            [ "$model_mode" = "2" ] && require_int8=1
+                        fi
+                    elif [ "$algorithm_mode" = "2" ]; then
+                        algorithm="dis"
+                    else
+                        echo -e "${YELLOW}Opção inválida; seguindo apenas com FSR.${NC}"
+                    fi
+                    if [ -n "$algorithm" ]; then
+                        if start_frameflow "$algorithm" "$model_dir" "$gpu_id" "$require_int8"; then
+                            args+=(--framegen "$factor" --frameflow-socket "$FRAMEFLOW_SOCKET")
+                        else
+                            echo -e "${YELLOW}Framegen não iniciado; seguindo apenas com FSR.${NC}"
+                        fi
+                    fi
+                else
+                    echo -e "${YELLOW}Multiplicador inválido; seguindo apenas com FSR.${NC}"
+                fi
+            fi
             run_bin "${args[@]}"
+            stop_frameflow
             ;;
         2)
             echo -e "${GREEN}👁️  Modo Preview${NC}"

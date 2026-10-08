@@ -15,6 +15,9 @@ Captura a janela de um jogo ou aplicativo em execução e aplica o upscaling da 
 - Captura a tela/janela via **X11**.
 - Aplica o **FSR 1.0** (EASU para upscaling espacial + RCAS para nitidez).
 - Exibe o resultado em uma janela de preview via **Vulkan**.
+- No modo FSR, uma thread dedicada captura a até 60 FPS e o renderizador consome o frame mais recente concluído, evitando bloquear o envio de trabalho à GPU pela espera do X11.
+- A apresentação prefere **MAILBOX** quando suportado, para descartar frames antigos na fila; usa **FIFO** como fallback.
+- A geração RIFE é opcional e se comunica com o serviço independente Open-FrameFlow por socket Unix; sem o serviço, o FSR funciona normalmente.
 
 ---
 
@@ -73,6 +76,35 @@ Captura a janela de um jogo ou aplicativo em execução e aplica o upscaling da 
    ```bash
    ./ui.sh
    ```
+
+Habilite geração de frames com `--framegen 2`, `--framegen 3` ou
+`--framegen 4`. O serviço Open-FrameFlow continua sendo um executável separado,
+mas `start.sh` e a GUI podem iniciá-lo e encerrá-lo automaticamente. Aponte
+`OPEN_FRAMEFLOW_BIN` e `OPEN_FRAMEFLOW_MODEL` para personalizar os caminhos; na
+GUI ambos também podem ser editados antes de iniciar o FSR. O launcher permite
+escolher RIFE na GPU ou Optical Flow DIS na CPU. O DIS não precisa de modelo
+RIFE, usa a resolução recebida e reduz a carga de geração na GPU, transferindo
+trabalho para a CPU; não há garantia de que acompanhe o FPS em todo hardware.
+Para compilar o Open-FrameFlow com DIS, instale `libopencv-dev`.
+No modo FrameFlow, o Open-Scaling prefere automaticamente uma GPU integrada que
+suporte apresentação Vulkan, para renderizar no adaptador associado à tela; o
+serviço RIFE continua independente e pode usar a GPU dedicada. `--vk-gpu INDEX`
+seleciona explicitamente um índice da lista Vulkan impressa no início, e
+`--vk-gpu auto` volta à seleção automática.
+O modo de framegen usa FIFO/VSync e apresenta na ordem cada quadro de origem e
+seus intermediários RIFE. A captura reduz sua cadência de origem para que o
+multiplicador caiba na taxa de atualização do monitor (por exemplo, 30→60 FPS
+com fator 2 em uma tela de 60 Hz). Com o serviço ativo, o VSync controla a
+cadência de apresentação, sem um segundo limitador de FPS no loop. Se a
+inferência não acompanhar, a apresentação espera pelo quadro esperado em vez de
+substituí-lo por um quadro fora de ordem; isso pode aumentar a latência, que é
+limitada por filas curtas e backpressure.
+Na inicialização de framegen, o launcher permite selecionar o modelo RIFE
+original, uma pasta já quantizada em INT8 ou DIS na CPU. INT8 requer um
+`flownet.param` e
+`flownet.bin` convertidos e calibrados; essa seleção não converte o modelo.
+O servidor verifica a presença de camadas INT8 no parâmetro antes de aceitar
+essa opção.
 
 ---
 

@@ -32,9 +32,13 @@ extern "C" {
 #include <cstdint>
 #include <cmath>
 #include <ctime>
+#include <algorithm>
+#include <fcntl.h>
 #include <vector>
 #include <string>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -56,10 +60,13 @@ struct Proc {
     pid_t pid = -1;
     int   fd  = -1;   // leitura do stdout+stderr do filho
     char  label[96] = "";
+    std::string partial;
 };
 
 extern "C" int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
-                              float scale, uint32_t max_w, uint32_t max_h);
+                              float scale, uint32_t max_w, uint32_t max_h,
+                              bool framegen_enabled, uint32_t framegen_factor,
+                              const char *frameflow_socket, int requested_gpu);
 
 struct VkGui {
     SDL_Window      *window   = nullptr;
@@ -95,6 +102,19 @@ struct VkGui {
     bool       capturing = false;
     Window     target_id = 0;
     std::string target_title;
+    Proc frameflow_proc;
+    char frameflow_binary[512] = "../Open-FrameFlow/build/open-frameflow";
+    char frameflow_model[512] = "";
+    char frameflow_socket[108] = "";
+    char frameflow_runtime_dir[128] = "";
+    char frameflow_active_binary[512] = "";
+    char frameflow_active_model[512] = "";
+    int frameflow_gpu = 1;
+    int frameflow_active_gpu = -1;
+    int frameflow_algorithm = 0;
+    int frameflow_active_algorithm = -1;
+    int framegen_model_type = 0;
+    int frameflow_active_model_type = -1;
 
     struct WinEntry { Window id; std::string title; int w; int h; };
     std::vector<WinEntry> windows;
@@ -108,6 +128,8 @@ struct VkGui {
     int   max_w = 1920;
     int   max_h = 1080;
     int   profile = 1;
+    bool  framegen_enabled = false;
+    int   framegen_factor = 0;
 
     bool  show_capture = true;
     bool  show_console = true;
@@ -190,18 +212,25 @@ static time_t bin_mtime() {
     return stat(BIN_PATH, &st) == 0 ? st.st_mtime : 0;
 }
 
-static void proc_pump(VkGui *g);   // adiante
+static void proc_pump(VkGui *g, Proc &p);   // adiante
 
 // Lanca o binario em modo texto com os argumentos dados (equivalente ao
 // run_bin do start.sh). O filho herda o ambiente; stdout/stderr viram um
 // pipe que a gente drena no console da UI.
-static bool spawn_bin(VkGui *g, const char *label, char *const argv[]) {
-    if (g->proc.pid > 0) {
-        gui_log(g, "ja existe '%s' rodando; encerre-a antes", g->proc.label);
+static bool spawn_process(VkGui *g, Proc &proc, const char *path,
+                          const char *label, char *const argv[]) {
+    if (proc.pid > 0) {
+        gui_log(g, "ja existe '%s' rodando; encerre-a antes", proc.label);
         return false;
     }
     int pfd[2];
     if (pipe(pfd) != 0) { gui_log(g, "pipe() falhou"); return false; }
+    const int read_flags = fcntl(pfd[0], F_GETFL, 0);
+    if (read_flags < 0 || fcntl(pfd[0], F_SETFL, read_flags | O_NONBLOCK) < 0) {
+        gui_log(g, "nao foi possivel tornar o pipe nao bloqueante");
+        close(pfd[0]); close(pfd[1]);
+        return false;
+    }
 
     fflush(stdout);
     pid_t pid = fork();
@@ -216,47 +245,57 @@ static bool spawn_bin(VkGui *g, const char *label, char *const argv[]) {
         close(pfd[0]); close(pfd[1]);
         char *full[64];
         int n = 0;
-        full[n++] = (char *)BIN_PATH;
+        full[n++] = (char *)path;
         for (; argv[n - 1] && n < 63; n++) full[n] = argv[n - 1];
         full[n] = nullptr;
-        execv(BIN_PATH, full);
+        execv(path, full);
         _exit(127);
     }
     close(pfd[1]);
-    g->proc.pid = pid;
-    g->proc.fd = pfd[0];
-    snprintf(g->proc.label, sizeof(g->proc.label), "%s", label);
-    gui_log(g, "$ %s %s", BIN_PATH, label);
-    proc_pump(g);
+    proc.pid = pid;
+    proc.fd = pfd[0];
+    snprintf(proc.label, sizeof(proc.label), "%s", label);
+    gui_log(g, "$ %s %s", path, label);
+    proc_pump(g, proc);
     return true;
+}
+
+static bool spawn_bin(VkGui *g, const char *label, char *const argv[]) {
+    if (g->proc.pid > 0) {
+        gui_log(g, "ja existe '%s' rodando; encerre-a antes", g->proc.label);
+        return false;
+    }
+    return spawn_process(g, g->proc, BIN_PATH, label, argv);
 }
 
 static bool spawn_cmd(VkGui *g, const char *label, const char *a = nullptr,
                       const char *b = nullptr, const char *c = nullptr,
-                      const char *d = nullptr, const char *e = nullptr) {
-    char *argv[7] = { (char *)a, (char *)b, (char *)c, (char *)d, (char *)e, nullptr };
+                      const char *d = nullptr, const char *e = nullptr,
+                      const char *f = nullptr, const char *h = nullptr,
+                      const char *i = nullptr, const char *j = nullptr) {
+    char *argv[10] = { (char *)a, (char *)b, (char *)c, (char *)d, (char *)e,
+                       (char *)f, (char *)h, (char *)i, (char *)j, nullptr };
+    argv[9] = nullptr;
     return spawn_bin(g, label, argv);
 }
 
 // Drena o pipe do filho sem bloquear a UI; linhas viram entradas do console.
-static void proc_pump(VkGui *g) {
-    Proc &p = g->proc;
+static void proc_pump(VkGui *g, Proc &p) {
     if (p.pid <= 0) return;
 
     char buf[4096];
-    static std::string partial;
     for (;;) {
         ssize_t r = read(p.fd, buf, sizeof(buf));
         if (r > 0) {
-            partial.append(buf, (size_t)r);
+            p.partial.append(buf, (size_t)r);
             size_t nl;
-            while ((nl = partial.find('\n')) != std::string::npos) {
-                std::string line = partial.substr(0, nl);
-                partial.erase(0, nl + 1);
+            while ((nl = p.partial.find('\n')) != std::string::npos) {
+                std::string line = p.partial.substr(0, nl);
+                p.partial.erase(0, nl + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 gui_log(g, "%s", line.c_str());
             }
-            if (partial.size() > 8192) partial.clear();   // proteção anti-travamento
+            if (p.partial.size() > 8192) p.partial.clear();
             continue;
         }
         if (r < 0 && errno == EINTR) continue;
@@ -266,7 +305,10 @@ static void proc_pump(VkGui *g) {
     int status = 0;
     pid_t w = waitpid(p.pid, &status, WNOHANG);
     if (w == p.pid) {
-        if (!partial.empty()) { gui_log(g, "%s", partial.c_str()); partial.clear(); }
+        if (!p.partial.empty()) {
+            gui_log(g, "%s", p.partial.c_str());
+            p.partial.clear();
+        }
         if (WIFEXITED(status))
             gui_log(g, "'%s' terminou (codigo %d)%s", p.label, WEXITSTATUS(status),
                     WEXITSTATUS(status) ? " <- erro" : "");
@@ -286,6 +328,171 @@ static void proc_kill(VkGui *g) {
 static void proc_force_kill(VkGui *g) {
     if (g->proc.pid <= 0) return;
     kill(g->proc.pid, SIGKILL);
+}
+
+static bool frameflow_socket_ready(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return false;
+    sockaddr_un address = {};
+    address.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(address.sun_path)) {
+        close(fd);
+        return false;
+    }
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+    const bool connected =
+        connect(fd, (sockaddr *)&address, sizeof(address)) == 0;
+    close(fd);
+    return connected;
+}
+
+static void stop_frameflow_service(VkGui *g) {
+    Proc &proc = g->frameflow_proc;
+    if (proc.pid > 0) {
+        gui_log(g, "encerrando servico Open-FrameFlow...");
+        if (kill(proc.pid, SIGTERM) != 0 && errno != ESRCH)
+            gui_log(g, "falha ao enviar SIGTERM ao Open-FrameFlow: %s",
+                    strerror(errno));
+        int status = 0;
+        pid_t result;
+        do {
+            result = waitpid(proc.pid, &status, 0);
+        } while (result < 0 && errno == EINTR);
+        if (result < 0 && errno != ECHILD)
+            gui_log(g, "waitpid do Open-FrameFlow falhou: %s", strerror(errno));
+        if (proc.fd >= 0) close(proc.fd);
+        proc = Proc{};
+    }
+    if (g->frameflow_socket[0]) {
+        unlink(g->frameflow_socket);
+        g->frameflow_socket[0] = '\0';
+    }
+    if (g->frameflow_runtime_dir[0]) {
+        rmdir(g->frameflow_runtime_dir);
+        g->frameflow_runtime_dir[0] = '\0';
+    }
+    g->frameflow_active_binary[0] = '\0';
+    g->frameflow_active_model[0] = '\0';
+    g->frameflow_active_gpu = -1;
+    g->frameflow_active_algorithm = -1;
+    g->frameflow_active_model_type = -1;
+}
+
+static bool start_frameflow_service(VkGui *g) {
+    if (g->frameflow_proc.pid > 0) {
+        const bool same_settings =
+            strcmp(g->frameflow_binary, g->frameflow_active_binary) == 0 &&
+            strcmp(g->frameflow_model, g->frameflow_active_model) == 0 &&
+            g->frameflow_gpu == g->frameflow_active_gpu &&
+            g->frameflow_algorithm == g->frameflow_active_algorithm &&
+            g->framegen_model_type == g->frameflow_active_model_type;
+        if (same_settings && frameflow_socket_ready(g->frameflow_socket))
+            return true;
+        if (g->proc.pid > 0) {
+            gui_log(g, "pare o FSR antes de trocar o algoritmo/modelo");
+            return false;
+        }
+        stop_frameflow_service(g);
+    }
+    if (g->proc.pid > 0) {
+        gui_log(g, "encerre '%s' antes de iniciar o servico", g->proc.label);
+        return false;
+    }
+    if (access(g->frameflow_binary, X_OK) != 0) {
+        gui_log(g, "Open-FrameFlow nao executavel: %s", g->frameflow_binary);
+        return false;
+    }
+    if (g->frameflow_algorithm == 0) {
+        if (!g->frameflow_model[0]) {
+            gui_log(g, "informe a pasta do modelo RIFE");
+            return false;
+        }
+        char model_file[sizeof(g->frameflow_model) + 32];
+        snprintf(model_file, sizeof(model_file), "%s/flownet.param",
+                 g->frameflow_model);
+        if (access(model_file, R_OK) != 0) {
+            gui_log(g, "flownet.param nao encontrado em %s", g->frameflow_model);
+            return false;
+        }
+        snprintf(model_file, sizeof(model_file), "%s/flownet.bin",
+                 g->frameflow_model);
+        if (access(model_file, R_OK) != 0) {
+            gui_log(g, "flownet.bin nao encontrado em %s", g->frameflow_model);
+            return false;
+        }
+    }
+
+    char runtime_template[] = "/tmp/open-frameflow-gui-XXXXXX";
+    char *runtime_dir = mkdtemp(runtime_template);
+    if (!runtime_dir) {
+        gui_log(g, "mkdtemp para socket FrameFlow falhou: %s", strerror(errno));
+        return false;
+    }
+    snprintf(g->frameflow_runtime_dir, sizeof(g->frameflow_runtime_dir),
+             "%s", runtime_dir);
+    snprintf(g->frameflow_socket, sizeof(g->frameflow_socket),
+             "%s/frameflow.sock", runtime_dir);
+
+    char gpu_id[16];
+    snprintf(gpu_id, sizeof(gpu_id), "%d", g->frameflow_gpu);
+    char *args[16];
+    int n = 0;
+    args[n++] = (char *)"--algorithm";
+    args[n++] = (char *)(g->frameflow_algorithm == 0 ? "rife" : "dis");
+    if (g->frameflow_algorithm == 0) {
+        args[n++] = (char *)"--model";
+        args[n++] = g->frameflow_model;
+        args[n++] = (char *)"--gpu";
+        args[n++] = gpu_id;
+        args[n++] = (char *)"--inference-scale";
+        args[n++] = (char *)"1.0";
+        if (g->framegen_model_type == 1)
+            args[n++] = (char *)"--require-int8";
+    }
+    args[n++] = (char *)"--socket";
+    args[n++] = g->frameflow_socket;
+    args[n] = nullptr;
+
+    char label[192];
+    if (g->frameflow_algorithm == 0) {
+        snprintf(label, sizeof(label), "Open-FrameFlow (RIFE %s, Vulkan GPU %d)",
+                 g->framegen_model_type == 1 ? "INT8" : "FP16",
+                 g->frameflow_gpu);
+    } else {
+        snprintf(label, sizeof(label), "Open-FrameFlow (DIS CPU)");
+    }
+    if (!spawn_process(g, g->frameflow_proc, g->frameflow_binary, label, args)) {
+        stop_frameflow_service(g);
+        return false;
+    }
+
+    for (int i = 0; i < 600; ++i) {
+        proc_pump(g, g->frameflow_proc);
+        if (g->frameflow_proc.pid <= 0) {
+            stop_frameflow_service(g);
+            gui_log(g, "Open-FrameFlow encerrou durante a inicializacao");
+            return false;
+        }
+        if (frameflow_socket_ready(g->frameflow_socket)) {
+            snprintf(g->frameflow_active_binary,
+                     sizeof(g->frameflow_active_binary), "%s",
+                     g->frameflow_binary);
+            snprintf(g->frameflow_active_model,
+                     sizeof(g->frameflow_active_model), "%s",
+                     g->frameflow_model);
+            g->frameflow_active_gpu = g->frameflow_gpu;
+            g->frameflow_active_algorithm = g->frameflow_algorithm;
+            g->frameflow_active_model_type = g->framegen_model_type;
+            gui_log(g, "Open-FrameFlow conectado pelo socket %s",
+                    g->frameflow_socket);
+            return true;
+        }
+        usleep(100000);
+    }
+
+    gui_log(g, "timeout aguardando o socket do Open-FrameFlow");
+    stop_frameflow_service(g);
+    return false;
 }
 
 // Executa um comando de shell (make, rm -rf, etc.) com saida no console.
@@ -611,6 +818,7 @@ static void recreate_swapchain(VkGui *g, int w, int h) {
 
 static void gui_destroy(VkGui *g) {
     if (g->capturing) capture_shutdown(&g->cap);
+    stop_frameflow_service(g);
     if (g->device) vkDeviceWaitIdle(g->device);
     // O descritor do preview vive no pool do backend: primeiro RemoveTexture,
     // depois Shutdown (que devolve o pool), só então destruir sampler/imagens.
@@ -897,6 +1105,46 @@ static void build_menu(VkGui *g) {
     // [1] Rodar FSR
     ImGui::Combo("Perfil", &g->profile, profiles, 4);
     ImGui::DragInt2("Resolucao maxima", &g->max_w, 16.f, 320, 3840, "%d");
+    ImGui::Checkbox("Frame Generation (Open-FrameFlow)", &g->framegen_enabled);
+    if (g->framegen_enabled) {
+        static const char *framegen_factors[] = { "2x", "3x", "4x" };
+        ImGui::Combo("Multiplicador de frames", &g->framegen_factor,
+                     framegen_factors, 3);
+        static const char *framegen_algorithms[] = {
+            "RIFE (Vulkan)", "Optical Flow DIS (CPU)"
+        };
+        ImGui::Combo("Metodo de framegen", &g->frameflow_algorithm,
+                     framegen_algorithms, 2);
+        if (g->frameflow_algorithm == 0) {
+            static const char *framegen_models[] = {
+            "Original (FP16 storage)", "Modelo quantizado INT8"
+            };
+            ImGui::Combo("Precisao/modelo RIFE", &g->framegen_model_type,
+                         framegen_models, 2);
+        }
+        ImGui::InputText("Executavel Open-FrameFlow", g->frameflow_binary,
+                         sizeof(g->frameflow_binary));
+        if (g->frameflow_algorithm == 0) {
+            ImGui::InputText("Pasta do modelo RIFE", g->frameflow_model,
+                             sizeof(g->frameflow_model));
+            ImGui::InputInt("GPU Vulkan do RIFE", &g->frameflow_gpu);
+            if (g->framegen_model_type == 1)
+                ImGui::TextDisabled("Use uma pasta convertida pelo ncnn2int8; "
+                                    "a opcao valida camadas INT8 no flownet.param.");
+        } else {
+            ImGui::TextDisabled("DIS calcula o fluxo na CPU; nao usa modelo RIFE.");
+        }
+        if (g->frameflow_proc.pid > 0) {
+            if (g->frameflow_active_algorithm == 0)
+                ImGui::Text("Servico FrameFlow ativo (RIFE, GPU %d).",
+                            g->frameflow_active_gpu);
+            else
+                ImGui::Text("Servico FrameFlow ativo (DIS, CPU).");
+            ImGui::SameLine();
+            if (ImGui::Button("Parar servico FrameFlow"))
+                stop_frameflow_service(g);
+        }
+    }
     if (ImGui::Button("Capturar para preview")) {
         if (!g->target_id) gui_log(g, "selecione uma janela primeiro");
         else start_capture(g, g->target_id);
@@ -913,12 +1161,29 @@ static void build_menu(VkGui *g) {
         if (!g->target_id) {
             gui_log(g, "selecione uma janela primeiro");
         } else if (ensure_binary(g)) {
-            char hex[32], maxres[32], label[128];
+            char hex[32], maxres[32], factor[2], label[160];
             snprintf(hex, sizeof(hex), "0x%lx", (unsigned long)g->target_id);
             snprintf(maxres, sizeof(maxres), "%dx%d", g->max_w, g->max_h);
-            snprintf(label, sizeof(label), "fsr %s %s --max %s",
-                     hex, profile_names[g->profile], maxres);
-            spawn_cmd(g, label, "fsr", hex, profile_names[g->profile], "--max", maxres);
+            if (g->framegen_enabled) {
+                const int factor_value =
+                    std::clamp(g->framegen_factor, 0, 2) + 2;
+                snprintf(factor, sizeof(factor), "%d", factor_value);
+                if (g->frameflow_algorithm == 0 && g->frameflow_gpu < 0) {
+                    gui_log(g, "o indice da GPU Vulkan nao pode ser negativo");
+                } else if (start_frameflow_service(g)) {
+                    snprintf(label, sizeof(label),
+                             "fsr %s %s --max %s --framegen %s",
+                             hex, profile_names[g->profile], maxres, factor);
+                    spawn_cmd(g, label, "fsr", hex, profile_names[g->profile],
+                              "--max", maxres, "--framegen", factor,
+                              "--frameflow-socket", g->frameflow_socket);
+                }
+            } else {
+                snprintf(label, sizeof(label), "fsr %s %s --max %s",
+                         hex, profile_names[g->profile], maxres);
+                spawn_cmd(g, label, "fsr", hex, profile_names[g->profile],
+                          "--max", maxres);
+            }
         }
     }
 
@@ -980,6 +1245,11 @@ static void build_menu(VkGui *g) {
     ImGui::Checkbox("Mostrar console", &g->show_console);
 
     ImGui::Spacing();
+    if (g->frameflow_proc.pid > 0) {
+        if (ImGui::Button("Parar servico Open-FrameFlow"))
+            stop_frameflow_service(g);
+        ImGui::SameLine();
+    }
     if (g->proc.pid > 0) {
         if (ImGui::Button("Encerrar processo")) proc_kill(g);
         ImGui::SameLine();
@@ -1083,6 +1353,15 @@ int vk_gui_run(void) {
     }
 
     VkGui *g = new VkGui();
+    if (const char *binary = std::getenv("OPEN_FRAMEFLOW_BIN"))
+        snprintf(g->frameflow_binary, sizeof(g->frameflow_binary), "%s", binary);
+    if (const char *model = std::getenv("OPEN_FRAMEFLOW_MODEL"))
+        snprintf(g->frameflow_model, sizeof(g->frameflow_model), "%s", model);
+    else if (const char *home = std::getenv("HOME"))
+        snprintf(g->frameflow_model, sizeof(g->frameflow_model),
+                 "%s/Repo/librife-ncnn-vulkan/models/rife-v4", home);
+    if (const char *gpu = std::getenv("OPEN_FRAMEFLOW_GPU"))
+        g->frameflow_gpu = std::max(0, std::atoi(gpu));
     g->window = SDL_CreateWindow("Open Scaling - Launcher (Dear ImGui)",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                  1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
@@ -1133,7 +1412,14 @@ int vk_gui_run(void) {
     double t0 = ImGui::GetTime();
 
     while (process_events(g)) {
-        proc_pump(g);           // drena stdout/stderr do comando em execucao
+        const pid_t command_pid = g->proc.pid;
+        proc_pump(g, g->proc);
+        if (command_pid > 0 && g->proc.pid == 0)
+            stop_frameflow_service(g);
+        const pid_t frameflow_pid = g->frameflow_proc.pid;
+        proc_pump(g, g->frameflow_proc);
+        if (frameflow_pid > 0 && g->frameflow_proc.pid == 0)
+            stop_frameflow_service(g);
         update_preview(g);
 
         frames++;

@@ -3,22 +3,47 @@
 #include "overlay_input.h"
 #include <SDL2/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <time.h>
 #include <X11/keysym.h>
 #include <linux/input-event-codes.h>
 #include "capture_x11.h"
+#include "frameflow_client.h"
 #include "input_uinput.h"
 
 #define VK_CHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[vk] %s falhou: %d\n", #x, _r); exit(1); } } while(0)
 
 #define MAX_FRAMES 2
-
-// Staging buffers triplas (ver tambem comentario na struct).
 #define STAGE_COUNT 3
+#define CAPTURE_SLOT_COUNT 3
+
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    CaptureX11 *cap;
+    unsigned char *frames[CAPTURE_SLOT_COUNT];
+    uint64_t sequence[CAPTURE_SLOT_COUNT];
+    uint64_t next_sequence;
+    uint64_t last_consumed_sequence;
+    size_t frame_size;
+    int reading_slot;
+    int writing_slot;
+    bool started;
+    bool stop;
+    bool failed;
+    FrameFlowClient *frameflow;
+    uint32_t framegen_factor;
+    uint64_t framegen_sequence;
+    uint32_t framegen_step;
+    uint64_t capture_interval_ns;
+} CaptureWorker;
 
 typedef struct {
     SDL_Window       *window;
@@ -26,6 +51,10 @@ typedef struct {
     VkSurfaceKHR      surface;
     VkPhysicalDevice  physical;
     uint32_t          qfam;
+    int               requested_gpu;
+    bool              prefer_integrated;
+    bool              stable_framegen;
+    bool              input_initialized;
     VkDevice          device;
     VkQueue           queue;
 
@@ -64,8 +93,7 @@ typedef struct {
     VkImage         up_img;       VkDeviceMemory up_mem;       VkImageView up_view;      // 1920x1080
     VkImage         final_img;    VkDeviceMemory final_mem;    VkImageView final_view;   // 1920x1080
 
-    // Staging buffers triplas: o CPU preenche um slot enquanto a GPU ainda
-    // consome o anterior, evitando bolhas de espera entre as duas pontas.
+    // Staging buffers triplos para nao sobrescrever memoria ainda lida pela GPU.
     VkBuffer         stage_buf[STAGE_COUNT];
     VkDeviceMemory   stage_mem[STAGE_COUNT];
     void            *stage_map[STAGE_COUNT];
@@ -78,8 +106,11 @@ typedef struct {
     VkSemaphore     *sem_done;
     VkFence         *fences;
     uint32_t         frame;
+    uint32_t         last_submitted_frame;
+    bool             has_submitted_frame;
 
     CaptureX11       cap;
+    CaptureWorker    capture_worker;
     uint32_t         in_w, in_h;
     uint32_t         out_w, out_h;
     bool             mouse_locked;
@@ -168,36 +199,94 @@ static void init_instance(VkUp *a) {
     }
 }
 
-static void pick_device(VkUp *a) {
+static bool pick_device(VkUp *a) {
     uint32_t n = 0;
-    vkEnumeratePhysicalDevices(a->instance, &n, NULL);
+    VkResult result = vkEnumeratePhysicalDevices(a->instance, &n, NULL);
+    if (result != VK_SUCCESS || n == 0) {
+        fprintf(stderr, "[vk] nenhuma GPU Vulkan encontrada (erro %d).\n", result);
+        return false;
+    }
     VkPhysicalDevice *d = malloc(sizeof(*d) * n);
-    vkEnumeratePhysicalDevices(a->instance, &n, d);
-    int best = -1;
+    uint32_t *queue_families = malloc(sizeof(*queue_families) * n);
+    if (!d || !queue_families) {
+        fprintf(stderr, "[vk] falha ao alocar lista de GPUs.\n");
+        free(d);
+        free(queue_families);
+        return false;
+    }
+    result = vkEnumeratePhysicalDevices(a->instance, &n, d);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "[vk] falha ao enumerar GPUs: %d.\n", result);
+        free(d);
+        free(queue_families);
+        return false;
+    }
+    for (uint32_t i = 0; i < n; ++i) queue_families[i] = UINT32_MAX;
+
+    int first_usable = -1;
+    int preferred = -1;
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d[i], &p);
-        printf("[vk] device %u: %s\n", i, p.deviceName);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { best = i; break; }
+        VkFormatProperties rgba_properties;
+        vkGetPhysicalDeviceFormatProperties(d[i], VK_FORMAT_R8G8B8A8_UNORM,
+                                             &rgba_properties);
+        const VkFormatFeatureFlags required_format_features =
+            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        if ((rgba_properties.optimalTilingFeatures & required_format_features) !=
+            required_format_features) {
+            printf("[vk] device %u: %s (formato de imagem FSR indisponivel)\n",
+                   i, p.deviceName);
+            continue;
+        }
+        uint32_t qn = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(d[i], &qn, NULL);
+        VkQueueFamilyProperties *qp = malloc(sizeof(*qp) * qn);
+        if (!qp) continue;
+        vkGetPhysicalDeviceQueueFamilyProperties(d[i], &qn, qp);
+        for (uint32_t q = 0; q < qn; ++q) {
+            if ((qp[q].queueFlags & (VK_QUEUE_GRAPHICS_BIT |
+                                     VK_QUEUE_COMPUTE_BIT)) !=
+                (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
+                continue;
+            VkBool32 present = VK_FALSE;
+            if (vkGetPhysicalDeviceSurfaceSupportKHR(d[i], q, a->surface,
+                                                      &present) != VK_SUCCESS)
+                present = VK_FALSE;
+            if (present) {
+                queue_families[i] = q;
+                break;
+            }
+        }
+        free(qp);
+        printf("[vk] device %u: %s%s\n", i, p.deviceName,
+               queue_families[i] == UINT32_MAX ? " (sem apresentacao)" : "");
+        if (queue_families[i] == UINT32_MAX) continue;
+        if (first_usable < 0) first_usable = (int)i;
+        const VkPhysicalDeviceType wanted = a->prefer_integrated
+            ? VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+            : VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        if (preferred < 0 && p.deviceType == wanted) preferred = (int)i;
     }
-    if (best < 0) best = 0;
-    a->physical = d[best];
+    int selected = a->requested_gpu >= 0 ? a->requested_gpu
+                                         : (preferred >= 0 ? preferred : first_usable);
+    if (selected < 0 || (uint32_t)selected >= n ||
+        queue_families[selected] == UINT32_MAX) {
+        fprintf(stderr,
+                "[vk] GPU solicitada (%d) nao existe ou nao suporta apresentacao Vulkan.\n",
+                selected);
+        free(d);
+        free(queue_families);
+        return false;
+    }
+    a->physical = d[selected];
+    a->qfam = queue_families[selected];
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(a->physical, &p);
-    printf("[vk] usando: %s\n", p.deviceName);
-
-    uint32_t qn = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(a->physical, &qn, NULL);
-    VkQueueFamilyProperties *qp = malloc(sizeof(*qp) * qn);
-    vkGetPhysicalDeviceQueueFamilyProperties(a->physical, &qn, qp);
-    a->qfam = UINT32_MAX;
-    for (uint32_t i = 0; i < qn; i++) {
-        if (!(qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-        VkBool32 pres = VK_FALSE;
-        vkGetPhysicalDeviceSurfaceSupportKHR(a->physical, i, a->surface, &pres);
-        if (pres) { a->qfam = i; break; }
-    }
-    free(qp); free(d);
-    if (a->qfam == UINT32_MAX) { fprintf(stderr, "sem queue\n"); exit(1); }
+    printf("[vk] usando GPU %d para render/apresentacao: %s\n", selected, p.deviceName);
+    free(d);
+    free(queue_families);
+    return true;
 }
 
 static void create_device(VkUp *a) {
@@ -235,7 +324,29 @@ static void create_swapchain(VkUp *a) {
         int w,h; SDL_Vulkan_GetDrawableSize(a->window, &w, &h);
         a->extent.width = w; a->extent.height = h;
     }
+
+    uint32_t mode_count = 0;
+    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(
+        a->physical, a->surface, &mode_count, NULL));
+    VkPresentModeKHR *modes = malloc(sizeof(*modes) * mode_count);
+    if (!modes) {
+        fprintf(stderr, "[vk] falha ao alocar lista de modos de apresentacao.\n");
+        exit(1);
+    }
+    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(
+        a->physical, a->surface, &mode_count, modes));
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    for (uint32_t i = 0; !a->stable_framegen && i < mode_count; i++) {
+        if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+            present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+            break;
+        }
+    }
+    free(modes);
+
     uint32_t ic = caps.minImageCount + 1;
+    if (present_mode == VK_PRESENT_MODE_MAILBOX_KHR && ic < 3)
+        ic = 3;
     if (caps.maxImageCount && ic > caps.maxImageCount) ic = caps.maxImageCount;
 
     VkSwapchainCreateInfoKHR ci = {
@@ -247,9 +358,12 @@ static void create_swapchain(VkUp *a) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-        .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE,
+        .presentMode = present_mode, .clipped = VK_TRUE,
     };
     VK_CHECK(vkCreateSwapchainKHR(a->device, &ci, NULL, &a->swapchain));
+    printf("[vk] apresentacao: %s%s\n",
+           present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO",
+           a->stable_framegen ? " (cadencia estavel)" : "");
     vkGetSwapchainImagesKHR(a->device, a->swapchain, &a->img_count, NULL);
     a->images = malloc(sizeof(VkImage) * a->img_count);
     vkGetSwapchainImagesKHR(a->device, a->swapchain, &a->img_count, a->images);
@@ -461,15 +575,16 @@ static void create_commands(VkUp *a) {
     VK_CHECK(vkAllocateCommandBuffers(a->device, &ai, a->cmds));
 
     a->sem_avail = malloc(sizeof(VkSemaphore) * MAX_FRAMES);
-    a->sem_done  = malloc(sizeof(VkSemaphore) * MAX_FRAMES);
+    a->sem_done  = malloc(sizeof(VkSemaphore) * a->img_count);
     a->fences    = malloc(sizeof(VkFence) * MAX_FRAMES);
     VkSemaphoreCreateInfo sci = { .sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     VkFenceCreateInfo fci = { .sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags=VK_FENCE_CREATE_SIGNALED_BIT };
     for (int i = 0; i < MAX_FRAMES; i++) {
         VK_CHECK(vkCreateSemaphore(a->device, &sci, NULL, &a->sem_avail[i]));
-        VK_CHECK(vkCreateSemaphore(a->device, &sci, NULL, &a->sem_done[i]));
         VK_CHECK(vkCreateFence(a->device, &fci, NULL, &a->fences[i]));
     }
+    for (uint32_t i = 0; i < a->img_count; i++)
+        VK_CHECK(vkCreateSemaphore(a->device, &sci, NULL, &a->sem_done[i]));
 }
 
 // ---------- FSR 1 constants ----------
@@ -518,20 +633,279 @@ static void convert_bgra_to_rgba(const unsigned char *src, int src_stride,
     }
 }
 
-// Dispara a captura do proximo frame sem bloquear: o servidor X responde em
-// background enquanto a CPU/GU continuam o pipeline do frame atual.
-static void begin_capture(VkUp *a) {
-    if (!capture_grab_async(&a->cap))
-        fprintf(stderr, "[fsr] aviso: capture_grab_async falhou\n");
+static void *capture_worker_main(void *userdata) {
+    CaptureWorker *worker = userdata;
+    CaptureX11 *cap = worker->cap;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        perror("[fsr] clock_gettime");
+        goto failed;
+    }
+
+    for (;;) {
+        pthread_mutex_lock(&worker->mutex);
+        bool stopping = worker->stop;
+        pthread_mutex_unlock(&worker->mutex);
+        if (stopping) return NULL;
+
+        if (!capture_grab(cap)) {
+            fprintf(stderr, "[fsr] XShmGetImage falhou na thread de captura.\n");
+            goto failed;
+        }
+        uint64_t sequence = frameflow_client_submit_ordered(
+            worker->frameflow, capture_data(cap), capture_stride(cap));
+        const bool ordered = sequence != 0 &&
+            frameflow_client_is_active(worker->frameflow);
+        pthread_mutex_lock(&worker->mutex);
+        int slot;
+        for (;;) {
+            if (worker->stop) {
+                pthread_mutex_unlock(&worker->mutex);
+                return NULL;
+            }
+            slot = -1;
+            for (int i = 0; i < CAPTURE_SLOT_COUNT; i++) {
+                const bool reusable = !ordered || worker->sequence[i] == 0 ||
+                    worker->sequence[i] <= worker->last_consumed_sequence;
+                if (reusable && i != worker->reading_slot &&
+                    i != worker->writing_slot) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot >= 0) break;
+            pthread_cond_wait(&worker->cond, &worker->mutex);
+        }
+        worker->writing_slot = slot;
+        pthread_mutex_unlock(&worker->mutex);
+
+        memcpy(worker->frames[slot], capture_data(cap), worker->frame_size);
+
+        pthread_mutex_lock(&worker->mutex);
+        if (!sequence)
+            sequence = worker->next_sequence + 1;
+        worker->sequence[slot] = sequence;
+        if (sequence > worker->next_sequence)
+            worker->next_sequence = sequence;
+        worker->writing_slot = -1;
+        pthread_cond_broadcast(&worker->cond);
+        pthread_mutex_unlock(&worker->mutex);
+
+        const uint64_t interval_ns =
+            frameflow_client_is_active(worker->frameflow)
+                ? worker->capture_interval_ns : 16666667ULL;
+        deadline.tv_sec += (time_t)(interval_ns / 1000000000ULL);
+        deadline.tv_nsec += (long)(interval_ns % 1000000000ULL);
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            perror("[fsr] clock_gettime");
+            goto failed;
+        }
+        if (deadline.tv_sec < now.tv_sec ||
+            (deadline.tv_sec == now.tv_sec && deadline.tv_nsec < now.tv_nsec))
+            deadline = now;
+        int sleep_result;
+        do {
+            sleep_result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
+                                           &deadline, NULL);
+        } while (sleep_result == EINTR);
+        if (sleep_result != 0) {
+            fprintf(stderr, "[fsr] falha ao aguardar intervalo de captura: %d\n",
+                    sleep_result);
+            goto failed;
+        }
+    }
+
+failed:
+    pthread_mutex_lock(&worker->mutex);
+    worker->failed = true;
+    pthread_cond_broadcast(&worker->cond);
+    pthread_mutex_unlock(&worker->mutex);
+    return NULL;
 }
 
-// Aguarda a resposta do pedido disparado por begin_capture() e preenche o
-// proximo staging buffer.
-static void finish_capture_and_upload(VkUp *a) {
-    if (!capture_grab_wait(&a->cap)) return;
-    convert_bgra_to_rgba(capture_data(&a->cap), capture_stride(&a->cap),
+static bool capture_worker_start(VkUp *a, bool framegen_enabled,
+                                 uint32_t framegen_factor,
+                                 uint32_t capture_fps,
+                                 const char *frameflow_socket) {
+    CaptureWorker *worker = &a->capture_worker;
+    worker->cap = &a->cap;
+    worker->frame_size = (size_t)capture_stride(&a->cap) * a->in_h;
+    worker->reading_slot = -1;
+    worker->writing_slot = -1;
+    for (int i = 0; i < CAPTURE_SLOT_COUNT; i++) {
+        worker->frames[i] = malloc(worker->frame_size);
+        if (!worker->frames[i]) {
+            fprintf(stderr, "[fsr] falha ao alocar buffer de captura.\n");
+            for (int j = 0; j < i; j++) free(worker->frames[j]);
+            return false;
+        }
+    }
+    if (pthread_mutex_init(&worker->mutex, NULL) != 0) {
+        fprintf(stderr, "[fsr] falha ao inicializar mutex de captura.\n");
+        for (int i = 0; i < CAPTURE_SLOT_COUNT; i++) free(worker->frames[i]);
+        return false;
+    }
+    if (pthread_cond_init(&worker->cond, NULL) != 0) {
+        fprintf(stderr, "[fsr] falha ao inicializar condicao de captura.\n");
+        pthread_mutex_destroy(&worker->mutex);
+        for (int i = 0; i < CAPTURE_SLOT_COUNT; i++) free(worker->frames[i]);
+        return false;
+    }
+    if (framegen_enabled)
+        worker->frameflow = frameflow_client_start(
+            frameflow_socket, a->in_w, a->in_h, framegen_factor);
+    worker->framegen_factor = framegen_factor;
+    worker->capture_interval_ns = capture_fps
+        ? 1000000000ULL / capture_fps : 16666667ULL;
+    if (pthread_create(&worker->thread, NULL, capture_worker_main, worker) != 0) {
+        fprintf(stderr, "[fsr] falha ao iniciar thread de captura.\n");
+        frameflow_client_stop(worker->frameflow);
+        pthread_cond_destroy(&worker->cond);
+        pthread_mutex_destroy(&worker->mutex);
+        for (int i = 0; i < CAPTURE_SLOT_COUNT; i++) free(worker->frames[i]);
+        return false;
+    }
+    worker->started = true;
+    return true;
+}
+
+static void capture_worker_stop(VkUp *a) {
+    CaptureWorker *worker = &a->capture_worker;
+    if (!worker->started) return;
+    pthread_mutex_lock(&worker->mutex);
+    worker->stop = true;
+    pthread_cond_broadcast(&worker->cond);
+    pthread_mutex_unlock(&worker->mutex);
+    frameflow_client_request_stop(worker->frameflow);
+    pthread_join(worker->thread, NULL);
+    frameflow_client_stop(worker->frameflow);
+    pthread_cond_destroy(&worker->cond);
+    pthread_mutex_destroy(&worker->mutex);
+    for (int i = 0; i < CAPTURE_SLOT_COUNT; i++) free(worker->frames[i]);
+    worker->started = false;
+}
+
+static bool capture_worker_upload_stable(VkUp *a);
+
+static bool capture_worker_upload_latest(VkUp *a) {
+    CaptureWorker *worker = &a->capture_worker;
+    if (frameflow_client_is_active(worker->frameflow)) {
+        if (capture_worker_upload_stable(a)) return true;
+        if (frameflow_client_is_active(worker->frameflow)) return false;
+        worker->framegen_sequence = 0;
+        worker->framegen_step = 0;
+        fprintf(stderr, "[frameflow] servico indisponivel; retomando frames originais.\n");
+    }
+    pthread_mutex_lock(&worker->mutex);
+    int slot;
+    for (;;) {
+        uint64_t newest_sequence = worker->last_consumed_sequence;
+        slot = -1;
+        for (int i = 0; i < CAPTURE_SLOT_COUNT; i++) {
+            if (i != worker->writing_slot &&
+                worker->sequence[i] > newest_sequence) {
+                newest_sequence = worker->sequence[i];
+                slot = i;
+            }
+        }
+        if (slot >= 0 || worker->failed || worker->stop) break;
+        pthread_cond_wait(&worker->cond, &worker->mutex);
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&worker->mutex);
+        fprintf(stderr, "[fsr] captura X11 interrompida.\n");
+        return false;
+    }
+
+    worker->reading_slot = slot;
+    worker->last_consumed_sequence = worker->sequence[slot];
+    pthread_mutex_unlock(&worker->mutex);
+
+    convert_bgra_to_rgba(worker->frames[slot], capture_stride(&a->cap),
                          (unsigned char *)a->stage_map[a->stage_idx],
                          a->in_w, a->in_h);
+
+    pthread_mutex_lock(&worker->mutex);
+    worker->reading_slot = -1;
+    pthread_cond_broadcast(&worker->cond);
+    pthread_mutex_unlock(&worker->mutex);
+    return true;
+}
+
+static bool capture_worker_upload_sequence(VkUp *a, uint64_t sequence) {
+    CaptureWorker *worker = &a->capture_worker;
+    pthread_mutex_lock(&worker->mutex);
+    int slot = -1;
+    for (;;) {
+        for (int i = 0; i < CAPTURE_SLOT_COUNT; ++i) {
+            if (worker->sequence[i] == sequence &&
+                i != worker->writing_slot) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot >= 0 || worker->failed || worker->stop ||
+            !frameflow_client_is_active(worker->frameflow))
+            break;
+        pthread_cond_wait(&worker->cond, &worker->mutex);
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&worker->mutex);
+        return false;
+    }
+
+    worker->reading_slot = slot;
+    worker->last_consumed_sequence = sequence;
+    pthread_mutex_unlock(&worker->mutex);
+
+    convert_bgra_to_rgba(worker->frames[slot], capture_stride(&a->cap),
+                         (unsigned char *)a->stage_map[a->stage_idx],
+                         a->in_w, a->in_h);
+
+    pthread_mutex_lock(&worker->mutex);
+    worker->reading_slot = -1;
+    pthread_cond_broadcast(&worker->cond);
+    pthread_mutex_unlock(&worker->mutex);
+    return true;
+}
+
+static bool capture_worker_upload_stable(VkUp *a) {
+    CaptureWorker *worker = &a->capture_worker;
+    FrameFlowClient *frameflow = worker->frameflow;
+    if (!frameflow_client_is_active(frameflow)) return false;
+
+    if (worker->framegen_sequence == 0) {
+        if (!capture_worker_upload_sequence(a, 1)) return false;
+        worker->framegen_sequence = 1;
+        worker->framegen_step = 0;
+        return true;
+    }
+
+    if (worker->framegen_step + 1 < worker->framegen_factor) {
+        const uint32_t next_step = worker->framegen_step + 1;
+        if (!frameflow_client_take_sequence(
+                frameflow, worker->framegen_sequence + 1, next_step,
+                (unsigned char *)a->stage_map[a->stage_idx])) {
+            if (frameflow_client_is_active(frameflow)) {
+                fprintf(stderr, "[frameflow] saida fora de ordem; interrompendo apresentacao estavel.\n");
+                return false;
+            }
+            return false;
+        }
+        worker->framegen_step = next_step;
+        return true;
+    }
+
+    const uint64_t next_sequence = worker->framegen_sequence + 1;
+    if (!capture_worker_upload_sequence(a, next_sequence)) return false;
+    worker->framegen_sequence = next_sequence;
+    worker->framegen_step = 0;
+    return true;
 }
 
 static void barrier(VkCommandBuffer cmd, VkImage img,
@@ -551,20 +925,17 @@ static void barrier(VkCommandBuffer cmd, VkImage img,
     vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0,NULL, 0,NULL, 1,&b);
 }
 
-static void draw(VkUp *a) {
-    // O pedido de captura foi enviado no draw anterior; o servidor X ja
-    // trabalhou nele enquanto a CPU fazia a conversao e a GPU renderizava.
-    finish_capture_and_upload(a);
+static bool draw(VkUp *a) {
+    if (!capture_worker_upload_latest(a)) return false;
 
+    if (a->stable_framegen && a->has_submitted_frame)
+        vkWaitForFences(a->device, 1,
+                        &a->fences[a->last_submitted_frame], VK_TRUE, UINT64_MAX);
     vkWaitForFences(a->device, 1, &a->fences[a->frame], VK_TRUE, UINT64_MAX);
     uint32_t ii;
     VkResult r = vkAcquireNextImageKHR(a->device, a->swapchain, UINT64_MAX,
         a->sem_avail[a->frame], VK_NULL_HANDLE, &ii);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { begin_capture(a); return; }
-
-    // Dispara a captura do PROXIMO frame antes de submeter a GPU: a
-    // latencia round-trip do X11 corre em paralelo com o compute/present.
-    begin_capture(a);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) return true;
     vkResetFences(a->device, 1, &a->fences[a->frame]);
 
     VkCommandBuffer cmd = a->cmds[a->frame];
@@ -572,10 +943,15 @@ static void draw(VkUp *a) {
     VkCommandBufferBeginInfo bi = { .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(cmd, &bi);
 
-    // 1) input_img: GENERAL -> TRANSFER_DST
-    barrier(cmd, a->input_img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            0, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // A imagem ainda esta em UNDEFINED no primeiro uso; depois disso fica em GENERAL.
+    barrier(cmd, a->input_img,
+            a->input_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            a->input_initialized ? VK_ACCESS_SHADER_READ_BIT : 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            a->input_initialized ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                 : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
 
     VkBufferImageCopy region = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
@@ -588,6 +964,7 @@ static void draw(VkUp *a) {
     barrier(cmd, a->input_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    a->input_initialized = true;
 
     // 3) up_img: UNDEFINED -> GENERAL
     barrier(cmd, a->up_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
@@ -665,18 +1042,21 @@ static void draw(VkUp *a) {
         .waitSemaphoreCount=1, .pWaitSemaphores=&a->sem_avail[a->frame],
         .pWaitDstStageMask=&wait,
         .commandBufferCount=1, .pCommandBuffers=&cmd,
-        .signalSemaphoreCount=1, .pSignalSemaphores=&a->sem_done[a->frame],
+        .signalSemaphoreCount=1, .pSignalSemaphores=&a->sem_done[ii],
     };
     VK_CHECK(vkQueueSubmit(a->queue, 1, &si, a->fences[a->frame]));
+    a->last_submitted_frame = a->frame;
+    a->has_submitted_frame = true;
 
     VkPresentInfoKHR pi = {
         .sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .waitSemaphoreCount=1, .pWaitSemaphores=&a->sem_done[a->frame],
+        .waitSemaphoreCount=1, .pWaitSemaphores=&a->sem_done[ii],
         .swapchainCount=1, .pSwapchains=&a->swapchain, .pImageIndices=&ii,
     };
     vkQueuePresentKHR(a->queue, &pi);
     a->frame = (a->frame + 1) % MAX_FRAMES;
     a->stage_idx = (a->stage_idx + 1) % STAGE_COUNT;
+    return true;
 }
 
 // ---------- Encaminhamento de entrada para a janela X11 capturada ----------
@@ -975,10 +1355,15 @@ static void wait_for_frame_deadline(uint64_t deadline, uint64_t frequency) {
 }
 
 int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
-                   float scale, uint32_t max_w, uint32_t max_h) {
+                   float scale, uint32_t max_w, uint32_t max_h,
+                   bool framegen_enabled, uint32_t framegen_factor,
+                   const char *frameflow_socket, int requested_gpu) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
     VkUp a = {0};
     a.virtual_mouse.fd = -1;
+    a.requested_gpu = requested_gpu;
+    a.prefer_integrated = framegen_enabled && requested_gpu < 0;
+    a.stable_framegen = framegen_enabled;
     if (!capture_init_target(&a.cap, target)) {
         fprintf(stderr, "capture_init_target falhou\n");
         SDL_Quit();
@@ -1012,7 +1397,12 @@ int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
     }
 
     init_instance(&a);
-    pick_device(&a);
+    if (!pick_device(&a)) {
+        capture_shutdown(&a.cap);
+        SDL_DestroyWindow(a.window);
+        SDL_Quit();
+        return 1;
+    }
     create_device(&a);
     create_swapchain(&a);
     create_present_pass(&a);
@@ -1024,17 +1414,34 @@ overlay_input_set_through(a.window);
     overlay_grab_key(SDLK_F3);
     overlay_grab_key(SDLK_F4);
 
-
     printf("[vk] overlay input-transparente. ESC/F3/F4 saem.\n");
 
-    // Primeira captura: enviada agora e consumida dentro de draw().
-    begin_capture(&a);
+    SDL_DisplayMode display_mode = {0};
+    uint32_t display_fps = 60;
+    const int display_index = SDL_GetWindowDisplayIndex(a.window);
+    if (display_index >= 0 &&
+        SDL_GetCurrentDisplayMode(display_index, &display_mode) == 0 &&
+        display_mode.refresh_rate > 0)
+        display_fps = (uint32_t)display_mode.refresh_rate;
+    uint32_t capture_fps = 60;
+    if (framegen_enabled) {
+        capture_fps = display_fps / framegen_factor;
+        if (capture_fps == 0) capture_fps = 1;
+        if (capture_fps > 60) capture_fps = 60;
+    }
+    if (!capture_worker_start(&a, framegen_enabled, framegen_factor,
+                              capture_fps, frameflow_socket)) {
+        capture_shutdown(&a.cap);
+        SDL_DestroyWindow(a.window);
+        SDL_Quit();
+        return 1;
+    }
 
     bool run = true;
     uint64_t f = 0, t0 = SDL_GetTicks64();
     const uint64_t perf_freq = SDL_GetPerformanceFrequency();
-    const uint64_t frame_interval = perf_freq / 60;
     uint64_t next_frame = SDL_GetPerformanceCounter();
+    uint64_t previous_interval = 0;
     while (run) {
         int hk;
         while ((hk = overlay_poll_hotkey()) != SDLK_UNKNOWN) {
@@ -1042,7 +1449,10 @@ overlay_input_set_through(a.window);
                 run = false;
         }
 
-        draw(&a);
+        if (!draw(&a)) {
+            run = false;
+            continue;
+        }
         f++;
         uint64_t now = SDL_GetTicks64();
         if (now - t0 >= 1000) {
@@ -1050,15 +1460,25 @@ overlay_input_set_through(a.window);
             f = 0; t0 = now;
         }
 
-        next_frame += frame_interval;
-        uint64_t perf_now = SDL_GetPerformanceCounter();
-        if (perf_now > next_frame)
-            next_frame = perf_now;
-        else
-            wait_for_frame_deadline(next_frame, perf_freq);
+        const bool framegen_active =
+            frameflow_client_is_active(a.capture_worker.frameflow);
+        if (!framegen_active) {
+            const uint64_t perf_now = SDL_GetPerformanceCounter();
+            const uint64_t frame_interval = perf_freq / 60;
+            if (frame_interval != previous_interval) {
+                next_frame = perf_now;
+                previous_interval = frame_interval;
+            }
+            next_frame += frame_interval;
+            if (perf_now > next_frame)
+                next_frame = perf_now;
+            else
+                wait_for_frame_deadline(next_frame, perf_freq);
+        }
     }
     vkDeviceWaitIdle(a.device);
     overlay_release_all();
+    capture_worker_stop(&a);
     capture_shutdown(&a.cap);
     SDL_DestroyWindow(a.window);
     SDL_Quit();
