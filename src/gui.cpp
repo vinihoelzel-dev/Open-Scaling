@@ -111,7 +111,7 @@ struct VkGui {
 
     bool  show_capture = true;
     bool  show_console = true;
-
+    bool  enable_framegen = false;
     // Medicoes
     double fps_live = 0.0;
     double bench_fps = 0.0, bench_min = 0.0, bench_max = 0.0, bench_avg = 0.0;
@@ -909,6 +909,11 @@ static void build_menu(VkGui *g) {
                            g->cap.width, g->cap.height);
     }
 
+    ImGui::Checkbox("Ativar Frame Generation (Experimental)", &g->enable_framegen);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Gera frames intermediarios via fluxo optico.\nAumenta a carga da GPU.");
+    }
+
     if (ImGui::Button("1. Rodar FSR (upscale)")) {
         if (!g->target_id) {
             gui_log(g, "selecione uma janela primeiro");
@@ -916,9 +921,29 @@ static void build_menu(VkGui *g) {
             char hex[32], maxres[32], label[128];
             snprintf(hex, sizeof(hex), "0x%lx", (unsigned long)g->target_id);
             snprintf(maxres, sizeof(maxres), "%dx%d", g->max_w, g->max_h);
-            snprintf(label, sizeof(label), "fsr %s %s --max %s",
-                     hex, profile_names[g->profile], maxres);
-            spawn_cmd(g, label, "fsr", hex, profile_names[g->profile], "--max", maxres);
+            
+            // Cria um label bonito para o console
+            snprintf(label, sizeof(label), "fsr %s %s --max %s%s",
+                     hex, profile_names[g->profile], maxres,
+                     g->enable_framegen ? " --framegen" : "");
+
+            // Constrói o array de argumentos manualmente para suportar o framegen
+            char *argv[8] = { 
+                (char*)"fsr", 
+                hex, 
+                (char*)profile_names[g->profile],
+                (char*)"--max", 
+                maxres, 
+                nullptr, nullptr, nullptr 
+            };
+            int argc = 5;
+            if (g->enable_framegen) {
+                argv[argc++] = (char*)"--framegen";
+            }
+            argv[argc] = nullptr; // Terminador nulo obrigatório
+            
+            // Chama o spawn_bin diretamente (em vez do spawn_cmd)
+            spawn_bin(g, label, argv);
         }
     }
 

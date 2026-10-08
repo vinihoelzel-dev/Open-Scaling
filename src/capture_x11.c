@@ -4,6 +4,18 @@
 #include <string.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <X11/Xproto.h>
+#include <X11/extensions/Xcomposite.h>   // <-- adiciona essa
+
+static int cap_x_error(Display *dpy, XErrorEvent *e) {
+    // BadMatch em XShmGetImage: deixa o XShmGetImage retornar False
+    // em vez de o Xlib abortar o processo.
+    char buf[256];
+    XGetErrorText(dpy, e->error_code, buf, sizeof buf);
+    fprintf(stderr, "[cap] X error ignorado: %s (req=%d minor=%d)\n",
+            buf, e->request_code, e->minor_code);
+    return 0;
+}
 
 bool capture_init(CaptureX11 *cap) {
     return capture_init_target(cap, 0);
@@ -98,6 +110,7 @@ bool capture_init_target(CaptureX11 *cap, Window target) {
 
     cap->dpy = XOpenDisplay(NULL);
     if (!cap->dpy) {
+        XSetErrorHandler(cap_x_error);
         fprintf(stderr, "[erro] XOpenDisplay falhou. DISPLAY=%s\n",
                 getenv("DISPLAY") ? getenv("DISPLAY") : "(null)");
         return false;
@@ -132,6 +145,26 @@ bool capture_init_target(CaptureX11 *cap, Window target) {
     printf("[cap] alvo=0x%08lx  %dx%d depth=%d\n",
            (unsigned long)cap->target, cap->width, cap->height, cap->depth);
 
+    // Sem compositor, uma janela coberta nao tem pixels no framebuffer e
+    // XShmGetImage devolve BadMatch. XCompositeRedirectWindow(Automatic)
+    // faz o proprio servidor manter um pixmap offscreen atualizado, mesmo
+    // com a janela ocluida. Nao precisa de compositor rodando.
+    int ev, err;
+    if (XCompositeQueryExtension(cap->dpy, &ev, &err)) {
+        XCompositeRedirectWindow(cap->dpy, cap->target,
+                                 CompositeRedirectAutomatic);
+        cap->pixmap = XCompositeNameWindowPixmap(cap->dpy, cap->target);
+        if (cap->pixmap) {
+            cap->use_composite = true;
+            printf("[cap] XComposite ativo, pixmap=0x%lx\n",
+                   (unsigned long)cap->pixmap);
+        } else {
+            fprintf(stderr, "[cap] NameWindowPixmap falhou, usando janela direta\n");
+        }
+    } else {
+        fprintf(stderr, "[cap] XComposite nao disponivel\n");
+    }
+
     cap->img = XShmCreateImage(
         cap->dpy, cap->visual, cap->depth, ZPixmap,
         NULL, &cap->shminfo, cap->width, cap->height);
@@ -164,19 +197,42 @@ bool capture_grab(CaptureX11 *cap) {
     return capture_grab_wait(cap);
 }
 
-// Captura via MIT-SHM. Nao existe "XShmGetImageAsync" na libXext; o ganho de
-// desempenho do SHM ja vem dai: o servidor X escreve os pixels direto na
-// memoria compartilhada e o cliente espera apenas um reply de poucos bytes
-// (sem transferencia de imagem pela socket X). Este chamada bloqueia somente
-// ate esse reply chegar; apos retornar true o buffer ja esta consistente.
+
 bool capture_grab_async(CaptureX11 *cap) {
-    return XShmGetImage(cap->dpy, cap->target, cap->img, 0, 0, AllPlanes)
-           == True;
+    // SDL reinstala o handler default do X durante SDL_CreateWindow /
+    // SDL_Vulkan_CreateSurface. Reinstalamos o nosso a cada frame para
+    // que BadMatch vire retorno False em vez de abortar o processo.
+    XSetErrorHandler(cap_x_error);
+
+    // XShmGetImage exige que o drawable tenha exatamente o mesmo
+    // tamanho/depth/visual do XImage criado no init. Se a janela
+    // redimensionou ou sumiu, avisamos e retornamos False.
+    XWindowAttributes attrs;
+    if (!XGetWindowAttributes(cap->dpy, cap->target, &attrs)) {
+        fprintf(stderr, "[cap] XGetWindowAttributes falhou antes do grab\n");
+        return false;
+    }
+    if (attrs.map_state != IsViewable) {
+        fprintf(stderr, "[cap] janela nao viewable (map_state=%d)\n",
+                attrs.map_state);
+        return false;
+    }
+    if (attrs.width != cap->width || attrs.height != cap->height) {
+        fprintf(stderr, "[cap] janela redimensionou: %dx%d -> %dx%d\n",
+                cap->width, cap->height, attrs.width, attrs.height);
+        return false;
+    }
+    if (attrs.depth != cap->depth) {
+        fprintf(stderr, "[cap] depth da janela mudou: %d -> %d\n",
+                cap->depth, attrs.depth);
+        return false;
+    }
+
+    Drawable src = cap->use_composite ? cap->pixmap : cap->target;
+    return XShmGetImage(cap->dpy, src, cap->img, 0, 0, AllPlanes) == True;
 }
 
-// Mantido por compatibilidade com o pipeline assincrono: como o XShmGetImage
-// acima ja garante a conclusao da transferencia, aqui apenas drenamos eventos
-// X pendentes (se houver) sem bloquear.
+
 bool capture_grab_wait(CaptureX11 *cap) {
     XEvent e;
     while (XPending(cap->dpy)) XNextEvent(cap->dpy, &e);
@@ -189,6 +245,7 @@ void capture_shutdown(CaptureX11 *cap) {
     if (cap->img) XDestroyImage(cap->img);
     if (cap->shminfo.shmaddr) shmdt(cap->shminfo.shmaddr);
     if (cap->shminfo.shmid >= 0) shmctl(cap->shminfo.shmid, IPC_RMID, NULL);
+    if (cap->pixmap) XFreePixmap(cap->dpy, cap->pixmap);
     XCloseDisplay(cap->dpy);
     memset(cap, 0, sizeof(*cap));
 }

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <X11/keysym.h>
+#include "vk_framegen.h"
 #include <linux/input-event-codes.h>
 #include "capture_x11.h"
 #include "input_uinput.h"
@@ -87,6 +88,8 @@ typedef struct {
     float            input_mouse_x, input_mouse_y;
     float            virtual_mouse_remainder_x, virtual_mouse_remainder_y;
     VirtualMouse     virtual_mouse;
+    FramegenContext framegen;
+    bool enable_framegen;
 } VkUp;
 
 // ---------- Utilitários ----------
@@ -589,6 +592,16 @@ static void draw(VkUp *a) {
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
+    // --- 2.5) FRAME GENERATION (Se ativado) ---
+    if (a->enable_framegen) {
+        framegen_dispatch(&a->framegen, cmd, a->input_view, a->input_img, a->in_w, a->in_h);
+        barrier(cmd, a->framegen.outImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
+    // ------------------------------------------
+
     // 3) up_img: UNDEFINED -> GENERAL
     barrier(cmd, a->up_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
             0, VK_ACCESS_SHADER_WRITE_BIT,
@@ -974,10 +987,12 @@ static void wait_for_frame_deadline(uint64_t deadline, uint64_t frequency) {
     while (SDL_GetPerformanceCounter() < deadline) {}
 }
 
-int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
-                   float scale, uint32_t max_w, uint32_t max_h) {
+int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h, float scale, uint32_t max_w, uint32_t max_h, bool enable_framegen) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+setvbuf(stderr, NULL, _IONBF, 0);
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
     VkUp a = {0};
+    
     a.virtual_mouse.fd = -1;
     if (!capture_init_target(&a.cap, target)) {
         fprintf(stderr, "capture_init_target falhou\n");
@@ -1001,14 +1016,15 @@ int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
            a.in_w, a.in_h, scale, max_w, max_h, screen_w, screen_h,
            a.out_w, a.out_h);
     a.window = SDL_CreateWindow("Open Scaling - FSR 1 (EASU+RCAS)",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        (int)a.out_w, (int)a.out_h, 
-        SDL_WINDOW_VULKAN | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_BORDERLESS);
+         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+         (int)a.out_w, (int)a.out_h,
+         SDL_WINDOW_VULKAN | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_BORDERLESS);
+
     if (!a.window) {
-        fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
-        capture_shutdown(&a.cap);
-        SDL_Quit();
-        return 1;
+         fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
+         capture_shutdown(&a.cap);
+         SDL_Quit();
+         return 1;
     }
 
     init_instance(&a);
@@ -1019,7 +1035,35 @@ int vk_upscale_run(Window target, uint32_t out_w, uint32_t out_h,
     create_resources(&a);
     create_commands(&a);
 
-overlay_input_set_through(a.window);
+    a.enable_framegen = enable_framegen;
+    if (enable_framegen) {
+        printf("[fsr] frame generation ativado\n");
+        framegen_init(&a.framegen, a.device, a.physical, a.in_w, a.in_h,
+                      a.cmd_pool, a.queue);
+
+        // Redireciona o binding 0 do easu_set para ler o frame
+        // interpolado em vez do frame bruto. Como outImageView e' um
+        // handle fixo, isso e' feito uma unica vez.
+        VkDescriptorImageInfo ii = {
+            .sampler     = a.sampler,
+            .imageView   = a.framegen.outImageView,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+        VkWriteDescriptorSet w = {
+            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet          = a.easu_set,
+            .dstBinding      = 0,
+            .descriptorCount = 1,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo      = &ii,
+        };
+        vkUpdateDescriptorSets(a.device, 1, &w, 0, NULL);
+    }
+
+    // --------------------------------------------------------------------------
+    // esse aqui é realmente o demonio enlatado
+ 
+    overlay_input_set_through(a.window);
     overlay_grab_key(SDLK_ESCAPE);
     overlay_grab_key(SDLK_F3);
     overlay_grab_key(SDLK_F4);

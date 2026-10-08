@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "vk_framegen.h"
 
 static bool parse_resolution(const char *text, uint32_t *width, uint32_t *height) {
     unsigned w, h;
@@ -33,6 +34,7 @@ static int cmd_fsr(int argc, char **argv) {
     uint32_t out_w = 0, out_h = 0;
     uint32_t max_w = 1920, max_h = 1080;
     float scale = 1.5f; // quality
+    bool enable_framegen = false; // adicionado
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--max") == 0) {
@@ -40,6 +42,8 @@ static int cmd_fsr(int argc, char **argv) {
                 fprintf(stderr, "[erro] use --max WxH.\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "--framegen") == 0) { // <--- ADICIONE ESTE BLOCO
+            enable_framegen = true;
         } else if (parse_resolution(argv[i], &out_w, &out_h)) {
             if (i + 1 < argc && strcmp(argv[i + 1], "--max") != 0) {
                 fprintf(stderr, "[erro] so uma resolucao de saida e permitida.\n");
@@ -62,7 +66,7 @@ static int cmd_fsr(int argc, char **argv) {
     }
     if (!target) target = capture_select_window();
     if (!target) return 1;
-    return vk_upscale_run(target, out_w, out_h, scale, max_w, max_h);
+    return vk_upscale_run(target, out_w, out_h, scale, max_w, max_h, enable_framegen);
 }
 
 static void salvar_ppm(const char *path, CaptureX11 *cap) {
